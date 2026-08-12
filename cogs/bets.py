@@ -207,6 +207,9 @@ class BetsCog(commands.Cog):
         db = self.bot.db  # type: ignore[attr-defined]
         bets = await db.get_bets_for_event(event, "ufc", interaction.user.id)
         if not bets:
+            # Fall back to fuzzy aliases (same card under a different label)
+            bets = await db.get_bets_for_event_matching(event, "ufc", interaction.user.id)
+        if not bets:
             await interaction.response.send_message(
                 f"No tracked bets found for **{event}**.", ephemeral=True
             )
