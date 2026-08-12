@@ -1,169 +1,273 @@
-# UFC Bet Tracker Discord Bot
+# UFCBOT — UFC (and NBA) Bet Tracker Discord Bot
 
-A personal Discord bot for logging UFC bets, resolving them with buttons, and
-pulling profit/loss stats — with real American-odds payout math.
+Personal Discord bot for logging MMA/UFC betting slips, building structured props from live FightOdds markets, settling wins/losses (manually or via ESPN auto-grade), and tracking profit/loss with real American-odds math.
 
-## File structure
+Access is restricted to allow-listed Discord user IDs. Each user’s bets are isolated.
+
+---
+
+## What it does
+
+| Area | Capability |
+|------|------------|
+| **Log bets** | Interactive `/bet-ufc` builder (fight → prop → units/odds) or free-text legs; simpler `/bet-nba` for NBA |
+| **Markets** | Live FightOdds props via FightIQ (methods, rounds, O/U, distance, etc.) — **labels only** in Discord (you enter your own odds) |
+| **Settle** | Persistent Won / Loss / Void buttons; share slips to channels; optional ESPN auto-grading |
+| **Recaps** | Event card view, P/L charts, visual spread-sheet image, XLSX-style recaps |
+| **Results** | All-time or per-event records with net units and W-L-V |
+
+---
+
+## High-level architecture
+
+```mermaid
+flowchart TB
+  subgraph discord [Discord]
+    User[User slash commands]
+    UI[Ephemeral builder and buttons]
+  end
+
+  subgraph bot [UFCBOT]
+    Cogs[Cogs: bets grading results pl]
+    Builder[bet_builder + FightIQ props]
+    DB[(SQLite bets.db)]
+    Grade[grading.py]
+  end
+
+  subgraph external [External data]
+    FO[FightOdds GraphQL]
+    ESPN[ESPN UFC scoreboard]
+  end
+
+  User --> Cogs
+  Cogs --> UI
+  Cogs --> Builder
+  Builder --> FO
+  Cogs --> DB
+  Grade --> ESPN
+  Grade --> DB
+  Cogs --> Grade
+```
+
+---
+
+## `/bet-ufc` flow (primary)
+
+The builder message is **ephemeral** (only you see fight/prop selects). After you finish, the logged bet card is also ephemeral; use **Share** to post publicly.
+
+```mermaid
+flowchart TD
+  start["/bet-ufc optional event"] --> defer[Defer ephemeral]
+  defer --> card[Load fight card FightOdds or ESPN]
+  card --> builder[Builder: pick fight or Free-Text Leg]
+  builder --> fight[Select fight]
+  fight --> props{Live FightOdds props?}
+  props -->|yes| browse[Popular / category / search / pages]
+  props -->|no| fallback[FightIQ method catalog fallback]
+  browse --> pick[Pick a play label only]
+  fallback --> pick
+  pick --> leg[Add structured leg]
+  leg --> more{Add another leg?}
+  more -->|yes| builder
+  more -->|Finish| modal[Units + American odds modal]
+  modal --> log[Save to SQLite]
+  log --> slip[Ephemeral bet card with Won/Loss/Void/Share]
+```
+
+**Structured legs** store `fighter_pick`, `outcome_type` (e.g. `ML`, `SUB`, `R_2`, `OVER_2_5`), and optional `outcome_round` so ESPN auto-grading can settle them later.
+
+---
+
+## Settling and auto-grading
+
+```mermaid
+flowchart LR
+  pending[Pending slip] --> manual[Won / Loss / Void buttons]
+  pending --> auto["/event-start monitors card"]
+  auto --> espn[ESPN fight results]
+  espn --> match[Match fighter + outcome_type]
+  match --> update[Update leg and bet status]
+  update --> debug[Optional debug channel notices]
+```
+
+- **Manual**: buttons on the bet card (owner only).
+- **Auto**: `/event-start` watches an event; as fights finish on ESPN, matching structured legs are graded (method/round/totals/distance rules in `grading.py`).
+- **Correct**: `/regrade-event` re-checks ESPN and fixes mistaken settles.
+- Free-text legs without structure stay pending until you grade them manually (or rematch tools structure them later).
+
+---
+
+## Commands
+
+### Betting
+
+| Command | Description |
+|---------|-------------|
+| `/bet-ufc` | Interactive UFC slip builder (straight / multi-leg / parlay). Optional `event` autocomplete from upcoming cards. |
+| `/bet-nba` | Log an NBA bet (free-text style legs). |
+| `/unit-size` | Set how much one unit is worth in your currency. |
+| `/delete-event` | Permanently delete all of **your** tracked UFC bets for one event. |
+| `/card` | List every UFC bet you’ve logged for a card. |
+| `/spread-sheet` | Generate a visual recap image of your bets for an event. |
+
+### Results and P/L
+
+| Command | Description |
+|---------|-------------|
+| `/results-ufc all-time` | All-time UFC results summary. |
+| `/results-ufc select-event` | Results for one event you’ve bet. |
+| `/results-nba` | All-time NBA results. |
+| `/pl` | Profit/loss overall or for one event (with chart). |
+
+### Grading
+
+| Command | Description |
+|---------|-------------|
+| `/grade` | Manually grade a pending UFC slip (by id or picker). |
+| `/regrade-event` | Re-fetch ESPN results and correct grades for an event. |
+| `/event-start` | Start auto-grading a UFC event as fights finish. |
+| `/event-end` | Stop auto-grading one event (or all if blank). |
+
+---
+
+## Bet card actions
+
+After logging, each slip has persistent buttons:
+
+- **Won / Loss / Void** — settle the slip (American-odds P/L applied when odds were set)
+- **Share** — post a public copy to a channel (this server or another the bot is in)
+- **Delete** — remove the slip (owner only)
+
+Views are re-registered on startup so buttons keep working after a restart.
+
+---
+
+## Profit math (American odds)
+
+Logic lives in `betting_math.py`:
+
+| Result | Odds | Profit |
+|--------|------|--------|
+| Won | Favorite (e.g. `-150`) | `units × (100 / \|odds\|)` |
+| Won | Underdog (e.g. `+120`) | `units × (odds / 100)` |
+| Won | No odds | `+units` (flat) |
+| Loss | any | `-units` |
+| Void | any | `0` |
+
+Currency and unit value are per user (`/unit-size` + config).
+
+---
+
+## FightIQ integration
+
+The `FightIQ/` package powers prop discovery:
+
+1. Resolve fight **slug** from the FightOdds card.
+2. Load `fightPropOfferTable` (popular / category / search) — **odds are not shown** in Discord.
+3. If FightOdds hasn’t posted props yet, fall back to FightIQ’s method catalog (ML, KO/SUB/DEC/ITD, rounds, O/U, distance, etc.).
+4. Selected plays map to structured `outcome_type` values for auto-grading.
+
+You still enter **your** book odds in the Finish modal.
+
+---
+
+## Project layout
 
 ```
-ufc-bet-bot/
-├── bot.py              # Entry point: intents, setup_hook, ESPN refresh loop, sync
-├── config.py            # Loads .env values
-├── database.py          # aiosqlite persistence layer
-├── betting_math.py       # American-odds profit calculation
-├── embeds.py             # Embed builders (bet card + results summary)
-├── espn.py               # ESPN scoreboard fetcher (upcoming UFC events)
-├── views.py              # Persistent Won/Loss/Void button View
+UFCBOT/
+├── bot.py                 # Entry: Discord client, cog load, event cache loop
+├── config.py              # .env + allow-list / currency settings
+├── database.py            # SQLite (bets, legs, monitored events)
+├── bet_builder.py         # Ephemeral /bet-ufc UI
+├── props_loader.py        # FightIQ catalog load + method fallback
+├── prop_play_map.py       # Play → structured leg (no odds)
+├── grading.py             # ESPN vs structured outcome rules
+├── card_data.py           # Upcoming events + fight cards (FightOdds / ESPN)
+├── client.py              # FightOdds GraphQL client
+├── espn.py                # ESPN scoreboard / results
+├── embeds.py / views.py   # Bet cards, share pickers, buttons
+├── betting_math.py        # American odds P/L
 ├── cogs/
-│   ├── __init__.py
-│   ├── bets.py           # /bet command
-│   └── results.py        # /results command
+│   ├── bets.py            # /bet-ufc, /bet-nba, card, spread-sheet, …
+│   ├── grading.py         # /grade, /event-start, auto loops
+│   ├── results.py         # /results-ufc
+│   ├── results_nba.py     # /results-nba
+│   └── pl.py              # /pl
+├── FightIQ/               # Prop catalog toolkit (imported at runtime)
 ├── requirements.txt
-├── .env.example
 └── README.md
 ```
 
-## 1. Create the Discord application & bot
+---
 
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**.
-2. Go to **Bot** → **Reset Token** → copy it. This is your `DISCORD_TOKEN`.
-3. Still on the **Bot** page: no privileged intents are required for this bot
-   (it doesn't read message content or member lists — everything is slash
-   commands and button clicks). You can leave Presence/Server Members/Message
-   Content intents off.
-4. Go to **OAuth2 → URL Generator**:
-   - Scopes: `bot`, `applications.commands`
-   - Bot permissions: `Send Messages`, `Embed Links`, `Read Message History`
-   - Open the generated URL and invite the bot to your server.
+## Setup
 
-## 2. Local setup
+### 1. Discord application
 
-```bash
-git clone <your-repo-or-copy-these-files>
-cd ufc-bet-bot
-python3 -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+1. [Discord Developer Portal](https://discord.com/developers/applications) → New Application → Bot → copy token.
+2. Privileged intents are **not** required (slash commands + components only).
+3. OAuth2 URL Generator: scopes `bot` + `applications.commands`; permissions **Send Messages**, **Embed Links**, **Read Message History**, **Attach Files** (for recap images).
 
-cp .env.example .env
-# then edit .env and paste in DISCORD_TOKEN (and optionally GUILD_ID)
+### 2. Environment
+
+Create a `.env` in the project root (never commit it):
+
+```env
+DISCORD_TOKEN=your_bot_token_here
+GUILD_ID=your_server_id_optional
+DB_PATH=bets.db
+EVENT_REFRESH_HOURS=72
 ```
 
-`.env` fields:
+| Variable | Required | Notes |
+|----------|----------|--------|
+| `DISCORD_TOKEN` | yes | Bot token |
+| `GUILD_ID` | no | Instant command sync to one guild; omit for global sync (~1 hour) |
+| `DB_PATH` | no | Defaults to `bets.db` |
+| `EVENT_REFRESH_HOURS` | no | Upcoming-card cache refresh interval (default 72) |
 
-| Key | Required | Notes |
-|---|---|---|
-| `DISCORD_TOKEN` | yes | From the Bot page above |
-| `GUILD_ID` | no | Your server's ID. If set, slash commands sync **instantly** to that one server (right-click your server icon → Copy Server ID, with Developer Mode on). If left blank, commands sync **globally**, which can take up to ~1 hour to show up the first time. |
-| `DB_PATH` | no | Defaults to `bets.db` in the project folder |
-| `EVENT_REFRESH_HOURS` | no | Defaults to 3 — how often the ESPN event cache refreshes |
+Allow-listed user IDs and per-user currency live in `config.py` (`ALLOWED_USER_IDS`, `USER_CURRENCY`).
 
-## 3. Run it
+### 3. Install and run
 
 ```bash
+git clone https://github.com/Lithiumwow/UFCBOT.git
+cd UFCBOT
+python -m venv venv
+# Windows: venv\Scripts\activate
+source venv/bin/activate
+pip install -r requirements.txt
 python bot.py
 ```
 
-On startup the bot:
-- connects to SQLite and creates the `bets` table if needed,
-- re-registers a persistent button View for every bet already in the
-  database (so old Won/Loss/Void buttons keep working after a restart),
-- fetches the next 3 UFC events from ESPN and starts the refresh loop,
-- syncs slash commands (guild-scoped if `GUILD_ID` is set, else global).
+On startup the bot connects SQLite, re-registers bet button views, refreshes upcoming UFC events (FightOdds + ESPN), and syncs slash commands.
 
-Slash commands don't need any manual registration step beyond this — the
-`self.tree.sync()` call in `setup_hook` in `bot.py` registers `/bet` and
-`/results` with Discord automatically every time the bot starts.
+### 4. Panel / VPS hosting
 
-## 4. ESPN endpoint used
+Works on hosts like PebbleHost: point the start file at `bot.py`, set env vars (or upload `.env`), keep `bets.db` on persistent storage, and redeploy/pull after Git updates.
 
-```
-https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard
-```
+---
 
-This is ESPN's public **scoreboard** endpoint for UFC (sport `mma`, league
-`ufc`) — the same JSON feed their own site/app calls. `espn.py` queries it
-with a `dates=YYYYMMDD-YYYYMMDD` parameter spanning the next 120 days
-(the bare endpoint alone tends to only return the current week), then
-filters to future events, sorts by date, and keeps the soonest 3.
+## Data sources
 
-**Important caveat:** this endpoint is public but unofficial and
-undocumented by ESPN — there's no published contract, auth, or SLA, and the
-shape or availability of the data could change or get rate-limited without
-notice. It's fine for a personal-scale bot polling every few hours, but
-don't build anything mission-critical on it. If it ever breaks, `/bet`
-still works fine — you'd just type the event name manually instead of
-picking from autocomplete.
+| Source | Used for |
+|--------|----------|
+| **FightOdds.io GraphQL** | Upcoming UFC cards, fight slugs, live prop market labels |
+| **ESPN MMA/UFC scoreboard** | Upcoming/live cards (fallback), fight results for auto-grading |
 
-## 5. How odds/profit math works
+Both are public/unofficial feeds — fine for a personal bot; shapes can change without notice.
 
-You asked for real odds tracking, so `/bet` has an optional `odds` field
-(American odds, e.g. `-150` or `+120`). If you leave it blank, that bet is
-treated as a flat 1:1 unit win/loss. Logic lives in `betting_math.py`:
+---
 
-- **Won**, odds given, favorite (negative, e.g. `-150`): `profit = units * (100 / |odds|)`
-- **Won**, odds given, underdog (positive, e.g. `+120`): `profit = units * (odds / 100)`
-- **Won**, no odds given: `profit = units` (flat)
-- **Loss**: `profit = -units`
-- **Void**: `profit = 0`
+## Privacy and access
 
-`/results` sums this per bet to get **Net Units**, plus win rate and a
-W-L-V record, for either one event or all-time.
+- Only users in `ALLOWED_USER_IDS` can run commands.
+- Bet builder and control slips are ephemeral by default.
+- Users cannot view or settle each other’s bets.
+- Do not commit `.env` or `bets.db`.
 
-## 6. Commands
+---
 
-### `/bet`
-All options are optional:
-- `event` — autocompletes from the next 3 upcoming UFC events (ESPN)
-- `bet_title` — free text, e.g. `"Jones ML"` or `"Fight goes over 1.5 rounds"`
-- `units` — decimal, defaults to `1.0`
-- `odds` — American odds, e.g. `-150` or `+120`
+## License / status
 
-Posts an embed with **Won / Loss / Void** buttons. Clicking a button updates
-the DB and re-colors the embed (green/red/gray). Buttons keep working after
-a bot restart.
-
-### `/results`
-- `scope` — `All-Time` or `Per-Event` (defaults to All-Time)
-- `event` — required when scope is Per-Event; autocompletes from events
-  you've actually logged bets against
-
-The response also includes **All-Time / Per-Event** toggle buttons so you
-can flip the view without re-running the command.
-
-## 7. Hosting it 24/7
-
-Any small always-on host works — this bot is lightweight (SQLite, no web
-server). A few solid options:
-
-- **A cheap VPS** (e.g. a $4-6/mo droplet/Lightsail/Hetzner box): run it
-  under `systemd` or inside `tmux`/`screen`, or wrap it with `pm2` /
-  `supervisord` for auto-restart on crash.
-- **Railway / Fly.io / Render** — deploy from a git repo, set env vars in
-  their dashboard instead of a `.env` file, add a persistent volume for
-  `bets.db` (important: don't lose your SQLite file on redeploy).
-- **A Raspberry Pi / home server** — perfectly fine for a personal bot like
-  this; just make sure it has a stable connection and auto-restarts on
-  reboot (`systemd` service or `pm2`).
-
-Example minimal `systemd` unit (`/etc/systemd/system/ufc-bet-bot.service`):
-
-```ini
-[Unit]
-Description=UFC Bet Tracker Discord Bot
-After=network.target
-
-[Service]
-WorkingDirectory=/opt/ufc-bet-bot
-ExecStart=/opt/ufc-bet-bot/venv/bin/python bot.py
-Restart=on-failure
-EnvironmentFile=/opt/ufc-bet-bot/.env
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then: `sudo systemctl enable --now ufc-bet-bot`.
-
-Whichever host you pick, back up `bets.db` periodically (it's the only
-persistent state) — e.g. a nightly cron job copying it somewhere safe.
+Personal project. Use and modify for your own Discord server.
