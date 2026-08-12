@@ -188,11 +188,7 @@ class BetsCog(commands.Cog):
                 "**Free-Text Leg** or try again in a moment."
             )
         elif event and fights:
-            with_slug = sum(1 for f in fights if len(f) > 2 and f[2])
-            note = (
-                f"\n\n_Loaded **{len(fights)}** fights"
-                f" ({with_slug} with live FightOdds props)._"
-            )
+            note = f"\n\n_Loaded **{len(fights)}** fights from the card._"
 
         message = await interaction.followup.send(
             content=session.summary_text() + note,
