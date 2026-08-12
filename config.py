@@ -20,6 +20,11 @@ GUILD_ID = int(_guild_id_raw) if _guild_id_raw else None
 
 DB_PATH = os.getenv("DB_PATH", "bets.db")
 
+# PebbleHost / Pterodactyl panel — used by /restart
+PANEL_API_URL = os.getenv("PANEL_API_URL", "https://panel.pebblehost.com").rstrip("/")
+PANEL_API_KEY = os.getenv("PANEL_API_KEY", "").strip()
+PANEL_SERVER_ID = os.getenv("PANEL_SERVER_ID", "").strip()
+
 # Only these Discord user IDs are allowed to use the bot's commands/buttons.
 # Each person's bets are fully isolated by their own user ID -- nobody sees
 # or can touch anyone else's bets, even though they share one bot/database.
