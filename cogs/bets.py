@@ -13,7 +13,7 @@ from bet_builder import BetBuilderSession, BuilderView
 from betting_math import CURRENCY_SYMBOLS, get_user_settings
 from embeds import build_bet_embed, build_results_embed
 from views import BetView, CardShareView, ConfirmDeleteEventView
-from checks import is_admin
+from checks import is_admin, resolve_allowed_target, target_user_id_from_namespace
 from spreadsheet_image import build_event_recap_image
 from leg_rematch import rematch_bets_to_card
 
@@ -54,7 +54,8 @@ class BetsCog(commands.Cog):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         db = self.bot.db  # type: ignore[attr-defined]
-        events = await db.get_distinct_events("ufc", interaction.user.id)
+        owner_id = target_user_id_from_namespace(interaction)
+        events = await db.get_distinct_events("ufc", owner_id)
         current_lower = current.lower()
         matches = [e for e in events if current_lower in e.lower()]
         return [app_commands.Choice(name=e[:100], value=e[:100]) for e in matches[:25]]
@@ -223,53 +224,67 @@ class BetsCog(commands.Cog):
             ),
         )
 
-    @app_commands.command(name="card", description="Show every UFC bet you've logged for a card")
+    @app_commands.command(name="card", description="Show UFC bets for a card (yours or another allowed user)")
     @is_admin()
     @app_commands.describe(
-        event="Which event to show (defaults to your most recent logged card)"
+        event="Which event to show (defaults to that user's most recent logged card)",
+        user="Optional: view another allowed user's card",
     )
     @app_commands.autocomplete(event=logged_ufc_event_autocomplete)
-    async def card(self, interaction: discord.Interaction, event: str | None = None):
+    async def card(
+        self,
+        interaction: discord.Interaction,
+        event: str | None = None,
+        user: discord.User | None = None,
+    ):
         db = self.bot.db  # type: ignore[attr-defined]
+        resolved = resolve_allowed_target(interaction, user)
+        if isinstance(resolved, str):
+            await interaction.response.send_message(resolved, ephemeral=True)
+            return
+        owner_id, owner = resolved
+        viewing_other = owner_id != interaction.user.id
 
         if not event:
-            # Prefer the latest event this user actually has bets on — not the
-            # next upcoming card (which often has zero logged slips yet).
-            logged = await db.get_distinct_events("ufc", interaction.user.id)
+            logged = await db.get_distinct_events("ufc", owner_id)
             event = logged[0] if logged else None
 
         if not event:
+            who = f"**{owner.display_name}** doesn't" if viewing_other else "You don't"
             await interaction.response.send_message(
-                "You don't have any logged UFC bets yet, so there's no card to show. "
+                f"{who} have any logged UFC bets yet, so there's no card to show. "
                 "Log one with `/bet-ufc`, or pass `event` explicitly.",
                 ephemeral=True,
             )
             return
 
-        bets = await db.get_bets_for_event_matching(event, "ufc", interaction.user.id)
+        bets = await db.get_bets_for_event_matching(event, "ufc", owner_id)
         if not bets:
-            logged = await db.get_distinct_events("ufc", interaction.user.id)
+            logged = await db.get_distinct_events("ufc", owner_id)
             hint = ", ".join(f"**{e}**" for e in logged[:8]) if logged else "(none)"
+            whose = f"{owner.display_name}'s" if viewing_other else "Your"
             await interaction.response.send_message(
                 f"No bets matched **{event}**.\n"
-                f"Your logged cards: {hint}",
+                f"{whose} logged cards: {hint}",
                 ephemeral=True,
             )
             return
 
-        unit_value, currency = await get_user_settings(db, interaction.user.id)
+        unit_value, currency = await get_user_settings(db, owner_id)
+        title = f"{event} · {owner.display_name}" if viewing_other else event
         embed = build_results_embed(
-            title=event,
+            title=title,
             bets=bets,
             unit_value=unit_value,
             currency=currency,
-            icon_url=interaction.user.display_avatar.url,
+            icon_url=owner.display_avatar.url,
             include_bet_list=True,
         )
         await interaction.response.send_message(
             embed=embed,
             view=CardShareView(
                 invoker_id=interaction.user.id,
+                owner_user_id=owner_id,
                 kind="card",
                 event=event,
                 sport="ufc",
@@ -278,21 +293,36 @@ class BetsCog(commands.Cog):
         )
 
     @app_commands.command(
-        name="spread-sheet", description="Generate a visual recap image of your UFC bets for an event"
+        name="spread-sheet",
+        description="Visual recap image for a UFC card (yours or another allowed user)",
     )
     @is_admin()
     @app_commands.describe(
-        event="Which event's bets to export (autocompletes from events you've logged bets against)"
+        event="Which event's bets to export",
+        user="Optional: build the sheet for another allowed user",
     )
     @app_commands.autocomplete(event=logged_ufc_event_autocomplete)
-    async def spread_sheet(self, interaction: discord.Interaction, event: str):
+    async def spread_sheet(
+        self,
+        interaction: discord.Interaction,
+        event: str,
+        user: discord.User | None = None,
+    ):
         db = self.bot.db  # type: ignore[attr-defined]
+        resolved = resolve_allowed_target(interaction, user)
+        if isinstance(resolved, str):
+            await interaction.response.send_message(resolved, ephemeral=True)
+            return
+        owner_id, owner = resolved
+        viewing_other = owner_id != interaction.user.id
 
-        # Exact + fuzzy alias names (Contender Season 10 Week 1 vs 2026: Week 1)
-        bets = await db.get_bets_for_event_matching(event, "ufc", interaction.user.id)
+        bets = await db.get_bets_for_event_matching(event, "ufc", owner_id)
         if not bets:
             await interaction.response.send_message(
-                f"No tracked bets found for **{event}**.", ephemeral=True
+                f"No tracked bets found for **{event}**"
+                + (f" ({owner.display_name})" if viewing_other else "")
+                + ".",
+                ephemeral=True,
             )
             return
 
@@ -303,7 +333,6 @@ class BetsCog(commands.Cog):
         except Exception:
             fights = []
 
-        # Backfill free-text slips onto the card so props show Fight / Opponent
         rematch_note = ""
         if fights:
             try:
@@ -314,9 +343,8 @@ class BetsCog(commands.Cog):
                         f" (+{stats['created_legs']} new legs)"
                     )
             except Exception:
-                pass  # recap still renders from live inference
+                pass
 
-        # Re-read after rematch so image uses persisted fighter_pick values
         for bet in bets:
             refreshed = await db.get_bet(bet["id"])
             if refreshed:
@@ -332,7 +360,7 @@ class BetsCog(commands.Cog):
                     event_date = None
                 break
 
-        unit_value, currency = await get_user_settings(db, interaction.user.id)
+        unit_value, currency = await get_user_settings(db, owner_id)
 
         image_bytes = build_event_recap_image(
             event_name=event,
@@ -346,13 +374,15 @@ class BetsCog(commands.Cog):
 
         safe_name = re.sub(r"[^\w\-]+", "_", event)[:60]
         fight_note = f" · {len(fights)} fights on card" if fights else " · card matchups unavailable"
+        whose = f" · {owner.display_name}" if viewing_other else ""
         await interaction.followup.send(
             content=(
-                f"📊 Recap for **{event}** ({len(bets)} bet(s){fight_note}{rematch_note})."
+                f"📊 Recap for **{event}**{whose} ({len(bets)} bet(s){fight_note}{rematch_note})."
             ),
             file=discord.File(io.BytesIO(image_bytes), filename=f"{safe_name}.png"),
             view=CardShareView(
                 invoker_id=interaction.user.id,
+                owner_user_id=owner_id,
                 kind="sheet",
                 event=event,
                 sport="ufc",

@@ -319,9 +319,11 @@ class CardShareView(discord.ui.View):
         event: str | None = None,
         sport: str = "ufc",
         pl_scope: str | None = None,
+        owner_user_id: int | None = None,
     ):
         super().__init__(timeout=600)
         self.invoker_id = invoker_id
+        self.owner_user_id = owner_user_id if owner_user_id is not None else invoker_id
         self.kind = kind  # card | pl | sheet
         self.event = event
         self.sport = sport
@@ -346,6 +348,7 @@ class CardShareView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         view = await ShareDestinationView.create(
             invoker_id=interaction.user.id,
+            owner_user_id=self.owner_user_id,
             interaction=interaction,
             card_event=self.event if self.kind == "card" else None,
             card_sport=self.sport,
@@ -381,6 +384,7 @@ class ShareDestinationView(discord.ui.View):
         pl_scope: str | None = None,
         pl_event: str | None = None,
         sheet_event: str | None = None,
+        owner_user_id: int | None = None,
     ):
         super().__init__(timeout=180)
         self.bet_id = bet_id
@@ -390,6 +394,7 @@ class ShareDestinationView(discord.ui.View):
         self.pl_event = pl_event
         self.sheet_event = sheet_event
         self.invoker_id = invoker_id
+        self.owner_user_id = owner_user_id if owner_user_id is not None else invoker_id
 
         ch_select = discord.ui.ChannelSelect(
             placeholder="Channel in this server…",
@@ -429,6 +434,7 @@ class ShareDestinationView(discord.ui.View):
         pl_scope: str | None = None,
         pl_event: str | None = None,
         sheet_event: str | None = None,
+        owner_user_id: int | None = None,
     ) -> ShareDestinationView:
         other: list[discord.SelectOption] = []
         here = interaction.guild
@@ -456,6 +462,7 @@ class ShareDestinationView(discord.ui.View):
             pl_event=pl_event,
             sheet_event=sheet_event,
             invoker_id=invoker_id,
+            owner_user_id=owner_user_id if owner_user_id is not None else invoker_id,
             other_guild_options=other,
         )
 
@@ -511,7 +518,7 @@ class ShareDestinationView(discord.ui.View):
                 interaction.client,
                 event=self.card_event,
                 sport=self.card_sport,
-                user_id=self.invoker_id,
+                user_id=self.owner_user_id,
             )
             if embed is None:
                 await self._reply(interaction, "Couldn't build the card summary.")
@@ -525,7 +532,7 @@ class ShareDestinationView(discord.ui.View):
         elif self.pl_scope:
             built = await _build_pl_share(
                 interaction.client,
-                user_id=self.invoker_id,
+                user_id=self.owner_user_id,
                 scope=self.pl_scope,
                 event=self.pl_event,
             )
@@ -545,7 +552,7 @@ class ShareDestinationView(discord.ui.View):
             built = await _build_sheet_share(
                 interaction.client,
                 event=self.sheet_event,
-                user_id=self.invoker_id,
+                user_id=self.owner_user_id,
             )
             if built is None:
                 await self._reply(interaction, "Couldn't build the sheet image.")
@@ -649,6 +656,7 @@ class ShareDestinationView(discord.ui.View):
 
         view = ShareGuildChannelView(
             invoker_id=self.invoker_id,
+            owner_user_id=self.owner_user_id,
             guild_name=guild.name,
             channels=channels,
             bet_id=self.bet_id,
@@ -686,6 +694,7 @@ class ShareGuildChannelView(discord.ui.View):
         pl_scope: str | None = None,
         pl_event: str | None = None,
         sheet_event: str | None = None,
+        owner_user_id: int | None = None,
     ):
         super().__init__(timeout=180)
         self.bet_id = bet_id
@@ -695,6 +704,7 @@ class ShareGuildChannelView(discord.ui.View):
         self.pl_event = pl_event
         self.sheet_event = sheet_event
         self.invoker_id = invoker_id
+        self.owner_user_id = owner_user_id if owner_user_id is not None else invoker_id
 
         options = [
             discord.SelectOption(
@@ -756,6 +766,7 @@ class ShareGuildChannelView(discord.ui.View):
             pl_event=self.pl_event,
             sheet_event=self.sheet_event,
             invoker_id=self.invoker_id,
+            owner_user_id=self.owner_user_id,
             other_guild_options=[],
         )
         await dest._post_to_channel(interaction, channel)

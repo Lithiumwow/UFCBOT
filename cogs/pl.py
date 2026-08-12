@@ -8,7 +8,7 @@ from discord.ext import commands
 
 import chart
 from betting_math import get_user_settings
-from checks import is_admin
+from checks import is_admin, resolve_allowed_target, target_user_id_from_namespace
 from embeds import build_pl_embed
 from views import CardShareView
 
@@ -23,19 +23,21 @@ class PLCog(commands.Cog):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         db = self.bot.db  # type: ignore[attr-defined]
-        events = await db.get_distinct_events("ufc", interaction.user.id)
+        owner_id = target_user_id_from_namespace(interaction)
+        events = await db.get_distinct_events("ufc", owner_id)
         current_lower = current.lower()
         matches = [e for e in events if current_lower in e.lower()]
         return [app_commands.Choice(name=e[:100], value=e[:100]) for e in matches[:25]]
 
     @app_commands.command(
         name="pl",
-        description="Show your profit/loss -- overall (all-time) or for one event",
+        description="Show profit/loss — yours or another allowed user",
     )
     @is_admin()
     @app_commands.describe(
         scope="Overall history, or a single event",
-        event="Required when scope is Event -- pick which card to pull P/L for",
+        event="Required when scope is Event — pick which card to pull P/L for",
+        user="Optional: view another allowed user's P/L",
     )
     @app_commands.choices(
         scope=[
@@ -49,8 +51,16 @@ class PLCog(commands.Cog):
         interaction: discord.Interaction,
         scope: app_commands.Choice[str],
         event: str | None = None,
+        user: discord.User | None = None,
     ):
         db = self.bot.db  # type: ignore[attr-defined]
+
+        resolved = resolve_allowed_target(interaction, user)
+        if isinstance(resolved, str):
+            await interaction.response.send_message(resolved, ephemeral=True)
+            return
+        owner_id, owner = resolved
+        viewing_other = owner_id != interaction.user.id
 
         if scope.value == "event" and not event:
             await interaction.response.send_message(
@@ -58,40 +68,39 @@ class PLCog(commands.Cog):
             )
             return
 
-        # Defer immediately -- chart rendering can exceed Discord's 3s window,
-        # which makes the whole reply fail (no embed AND no graph).
         await interaction.response.defer(ephemeral=True)
 
-        unit_value, currency = await get_user_settings(db, interaction.user.id)
+        unit_value, currency = await get_user_settings(db, owner_id)
+        whose = f" · {owner.display_name}" if viewing_other else ""
 
         if scope.value == "event":
-            bets = await db.get_bets_for_event_matching(event, "ufc", interaction.user.id)  # type: ignore[arg-type]
+            bets = await db.get_bets_for_event_matching(event, "ufc", owner_id)  # type: ignore[arg-type]
             if not bets:
                 await interaction.followup.send(
-                    f"No UFC bets found for **{event}**.",
+                    f"No UFC bets found for **{event}**{whose}.",
                     ephemeral=True,
                 )
                 return
             embed = build_pl_embed(
-                title=f"P/L — {event}",
+                title=f"P/L — {event}{whose}",
                 bets=bets,
                 unit_value=unit_value,
                 currency=currency,
-                icon_url=interaction.user.display_avatar.url,
+                icon_url=owner.display_avatar.url,
             )
-            chart_title = f"Units — {event}"
+            chart_title = f"Units — {event}{whose}"
             share_event = event
         else:
-            bets = await db.get_all_bets("ufc", interaction.user.id)
+            bets = await db.get_all_bets("ufc", owner_id)
             embed = build_pl_embed(
-                title="P/L — Overall (All-Time UFC)",
+                title=f"P/L — Overall (All-Time UFC){whose}",
                 bets=bets,
                 unit_value=unit_value,
                 currency=currency,
-                icon_url=interaction.user.display_avatar.url,
+                icon_url=owner.display_avatar.url,
                 include_event_breakdown=True,
             )
-            chart_title = "Cumulative Units — Overall"
+            chart_title = f"Cumulative Units — Overall{whose}"
             share_event = None
 
         files: list[discord.File] = []
@@ -108,6 +117,7 @@ class PLCog(commands.Cog):
             files=files,
             view=CardShareView(
                 invoker_id=interaction.user.id,
+                owner_user_id=owner_id,
                 kind="pl",
                 event=share_event,
                 pl_scope=scope.value,
