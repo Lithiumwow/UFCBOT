@@ -10,7 +10,7 @@ from discord.ext import commands
 import espn
 import card_data
 from bet_builder import BetBuilderSession, BuilderView
-from betting_math import CURRENCY_SYMBOLS, get_currency_for_user, get_user_settings
+from betting_math import CURRENCY_SYMBOLS, get_user_settings
 from embeds import build_bet_embed, build_results_embed
 from views import BetView, CardShareView, ConfirmDeleteEventView
 from checks import is_admin
@@ -390,23 +390,38 @@ class BetsCog(commands.Cog):
     # ---------- settings ----------
 
     @app_commands.command(
-        name="unit-size", description="Set how much one betting unit is worth in your currency"
+        name="unit-size",
+        description="Set how much 1 unit is worth and which currency to show on your slips",
     )
     @is_admin()
     @app_commands.describe(
-        amount="How much 1 unit is worth, in your own currency (e.g. 100 for £100 or €100)"
+        amount="How much 1 unit is worth (e.g. 100 for £100 / €100 / $100)",
+        currency="Currency shown on your bet slips and P/L (GBP, EUR, or USD)",
+    )
+    @app_commands.choices(
+        currency=[
+            app_commands.Choice(name="GBP (£)", value="GBP"),
+            app_commands.Choice(name="EUR (€)", value="EUR"),
+            app_commands.Choice(name="USD ($)", value="USD"),
+        ]
     )
     async def unit_size(
-        self, interaction: discord.Interaction, amount: app_commands.Range[float, 0.01, 1000000.0]
+        self,
+        interaction: discord.Interaction,
+        amount: app_commands.Range[float, 0.01, 1000000.0],
+        currency: app_commands.Choice[str],
     ):
         db = self.bot.db  # type: ignore[attr-defined]
-        await db.set_unit_value(interaction.user.id, amount)
+        code = currency.value.upper()
+        await db.set_user_settings(
+            interaction.user.id, unit_value=float(amount), currency=code
+        )
 
-        currency = get_currency_for_user(interaction.user.id)
-        symbol = CURRENCY_SYMBOLS.get(currency, currency + " ")
+        symbol = CURRENCY_SYMBOLS.get(code, code + " ")
         await interaction.response.send_message(
-            f"✅ Your unit size is now **1u = {symbol}{amount:,.2f}**. "
-            "This applies to all your future and existing bets across `/results` and `/card`.",
+            f"✅ Your settings are now **1u = {symbol}{amount:,.2f}** ({code}). "
+            "This applies to your bet slips, `/results`, `/pl`, and `/card`. "
+            "Auto-grading is unchanged — currency is display-only.",
             ephemeral=True,
         )
 

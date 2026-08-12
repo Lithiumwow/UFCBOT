@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS predictions (
 
 CREATE TABLE IF NOT EXISTS user_settings (
     user_id    INTEGER PRIMARY KEY,
-    unit_value REAL NOT NULL DEFAULT 100.0
+    unit_value REAL NOT NULL DEFAULT 100.0,
+    currency   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS monitored_events (
@@ -99,6 +100,7 @@ class Database:
             "ALTER TABLE bets ADD COLUMN opponent_pick TEXT",
             "ALTER TABLE bets ADD COLUMN outcome_type TEXT",
             "ALTER TABLE bets ADD COLUMN outcome_round INTEGER",
+            "ALTER TABLE user_settings ADD COLUMN currency TEXT",
         ):
             try:
                 await self._conn.execute(statement)
@@ -392,6 +394,16 @@ class Database:
         row = await cursor.fetchone()
         return row["unit_value"] if row else default
 
+    async def get_currency(self, user_id: int) -> Optional[str]:
+        cursor = await self._conn.execute(
+            "SELECT currency FROM user_settings WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        value = row["currency"]
+        return value if value else None
+
     async def set_unit_value(self, user_id: int, unit_value: float) -> None:
         await self._conn.execute(
             """
@@ -400,6 +412,44 @@ class Database:
             """,
             (user_id, unit_value),
         )
+        await self._conn.commit()
+
+    async def set_user_settings(
+        self,
+        user_id: int,
+        *,
+        unit_value: Optional[float] = None,
+        currency: Optional[str] = None,
+    ) -> None:
+        """Upsert unit size and/or currency for a user."""
+        existing = await self._conn.execute(
+            "SELECT unit_value, currency FROM user_settings WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await existing.fetchone()
+        if row is None:
+            await self._conn.execute(
+                """
+                INSERT INTO user_settings (user_id, unit_value, currency)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    user_id,
+                    unit_value if unit_value is not None else 100.0,
+                    currency,
+                ),
+            )
+        else:
+            new_unit = unit_value if unit_value is not None else row["unit_value"]
+            new_cur = currency if currency is not None else row["currency"]
+            await self._conn.execute(
+                """
+                UPDATE user_settings
+                SET unit_value = ?, currency = ?
+                WHERE user_id = ?
+                """,
+                (new_unit, new_cur, user_id),
+            )
         await self._conn.commit()
 
     # ---------- auto-grading ----------

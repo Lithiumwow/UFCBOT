@@ -20,17 +20,28 @@ from typing import Optional
 import config
 
 CURRENCY_SYMBOLS = config.CURRENCY_SYMBOLS
+SUPPORTED_CURRENCIES = ("GBP", "EUR", "USD")
 
 
 def get_currency_for_user(user_id: int) -> str:
+    """Config fallback when the user hasn't saved a currency in the DB yet."""
     return config.USER_CURRENCY.get(user_id, "GBP")
 
 
 async def get_user_settings(db, user_id: int) -> tuple[float, str]:
     """Returns (unit_value, currency) for a user -- the one place both are
-    resolved together, since almost every embed/chart call needs both."""
+    resolved together, since almost every embed/chart call needs both.
+
+    Currency preference order: DB override → config.USER_CURRENCY → GBP.
+    Changing currency only affects slip display / cash figures; auto-grading
+    is unaffected (it settles Won/Loss from fight results, not currency).
+    """
     unit_value = await db.get_unit_value(user_id, config.DEFAULT_UNIT_VALUE)
-    currency = get_currency_for_user(user_id)
+    stored = await db.get_currency(user_id)
+    if stored and stored.upper() in SUPPORTED_CURRENCIES:
+        currency = stored.upper()
+    else:
+        currency = get_currency_for_user(user_id)
     return unit_value, currency
 
 
