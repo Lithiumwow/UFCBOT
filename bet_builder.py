@@ -56,6 +56,10 @@ class BetBuilderSession:
         fights: list,
         invoker_id: int,
         cog,
+        max_legs: int = MAX_LEGS,
+        finish_label: str = "✅ Finish & Log Bet",
+        append_only: bool = False,
+        on_append=None,
     ):
         self.event = event
         # list of (fighter_a, fighter_b, slug|None)
@@ -64,6 +68,11 @@ class BetBuilderSession:
         self.cog = cog
         self.legs: list[dict] = []
         self.message: discord.Message | None = None
+        self.max_legs = max_legs
+        self.finish_label = finish_label
+        # When True, finish skips units/odds and calls on_append(interaction, legs)
+        self.append_only = append_only
+        self.on_append = on_append
 
     def summary_text(self) -> str:
         header = f"🥊 **Building bet for {self.event or '(no event set)'}**"
@@ -74,7 +83,7 @@ class BetBuilderSession:
         lines = "\n".join(
             f"{i}. {leg['description']}" for i, leg in enumerate(self.legs, start=1)
         )
-        remaining = MAX_LEGS - len(self.legs)
+        remaining = self.max_legs - len(self.legs)
         footer = (
             f"\n\n{remaining} more leg(s) can be added."
             if remaining > 0
@@ -163,11 +172,18 @@ class PropPlaySelect(discord.ui.Select):
         self.state = state
         options = []
         for play in state.page_slice()[:PAGE_SIZE]:
+            # Preview exactly what the leg will read as once picked (e.g.
+            # "Islam Makhachev ML"), rather than the raw FightOdds label --
+            # the dropdown itself should already read clearly, not just
+            # the description stored after selection.
+            preview = map_play_to_leg(play, fighter_a=state.fighter_a, fighter_b=state.fighter_b)
+            label = preview.get("description") or play.label or play.offer_type_id or "Play"
+            category_text = CATEGORY_LABELS.get(play.category, play.category or "")
             options.append(
                 discord.SelectOption(
-                    label=(play.label or play.offer_type_id or "Play")[:100],
+                    label=label[:100],
                     value=play.id[:100],
-                    description=(play.offer_type_id or play.category or "")[:100] or None,
+                    description=category_text[:100] or None,
                 )
             )
         if not options:
@@ -193,7 +209,7 @@ class PropPlaySelect(discord.ui.Select):
         if self.values[0] == "__empty__":
             await interaction.response.defer()
             return
-        if len(session.legs) >= MAX_LEGS:
+        if len(session.legs) >= session.max_legs:
             await interaction.response.send_message(
                 "⚠️ Max legs reached.", ephemeral=True
             )
@@ -460,7 +476,7 @@ class FreeTextLegModal(discord.ui.Modal, title="Add a Free-Text Leg"):
 
     async def on_submit(self, interaction: discord.Interaction):
         text = self.leg_input.value.strip()
-        if text and len(self.session.legs) < MAX_LEGS:
+        if text and len(self.session.legs) < self.session.max_legs:
             self.session.legs.append(parse_leg_line(text))
         await interaction.response.defer()
         await self.session.refresh_message()
@@ -522,7 +538,7 @@ class BuilderView(discord.ui.View):
         super().__init__(timeout=600)
         self.session = session
 
-        if len(session.legs) < MAX_LEGS and session.fights:
+        if len(session.legs) < session.max_legs and session.fights:
             self.add_item(FightSelect(session))
 
         freetext_btn = discord.ui.Button(
@@ -533,7 +549,7 @@ class BuilderView(discord.ui.View):
 
         if session.legs:
             finish_btn = discord.ui.Button(
-                label="✅ Finish & Log Bet", style=discord.ButtonStyle.success, row=1
+                label=session.finish_label, style=discord.ButtonStyle.success, row=1
             )
             finish_btn.callback = self._finish_callback
             self.add_item(finish_btn)
@@ -548,7 +564,7 @@ class BuilderView(discord.ui.View):
         return _check_invoker(interaction, self.session)
 
     async def _freetext_callback(self, interaction: discord.Interaction):
-        if len(self.session.legs) >= MAX_LEGS:
+        if len(self.session.legs) >= self.session.max_legs:
             await interaction.response.send_message(
                 "⚠️ Max legs reached.", ephemeral=True
             )
@@ -556,6 +572,14 @@ class BuilderView(discord.ui.View):
         await interaction.response.send_modal(FreeTextLegModal(self.session))
 
     async def _finish_callback(self, interaction: discord.Interaction):
+        if self.session.append_only and self.session.on_append is not None:
+            await self.session.on_append(interaction, list(self.session.legs))
+            try:
+                if self.session.message is not None:
+                    await self.session.message.delete()
+            except discord.HTTPException:
+                pass
+            return
         await interaction.response.send_modal(FinishBetModal(self.session))
 
     async def _cancel_callback(self, interaction: discord.Interaction):

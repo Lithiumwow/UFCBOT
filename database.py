@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS bets (
     fighter_pick  TEXT,
     opponent_pick TEXT,
     outcome_type  TEXT,
-    outcome_round INTEGER
+    outcome_round INTEGER,
+    co_user_id    INTEGER,
+    is_collab     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS predictions (
@@ -68,7 +70,33 @@ CREATE TABLE IF NOT EXISTS bet_legs (
     fighter_pick  TEXT,
     outcome_type  TEXT,
     outcome_round INTEGER,
-    status        TEXT NOT NULL DEFAULT 'pending'
+    status        TEXT NOT NULL DEFAULT 'pending',
+    added_by      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS collab_sessions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    code            TEXT NOT NULL UNIQUE,
+    event           TEXT,
+    host_user_id    INTEGER NOT NULL,
+    partner_user_id INTEGER,
+    guild_id        INTEGER,
+    channel_id      INTEGER,
+    message_id      INTEGER,
+    status          TEXT NOT NULL DEFAULT 'open',
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS collab_legs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    INTEGER NOT NULL,
+    user_id       INTEGER NOT NULL,
+    leg_index     INTEGER NOT NULL,
+    description   TEXT NOT NULL,
+    fighter_pick  TEXT,
+    outcome_type  TEXT,
+    outcome_round INTEGER,
+    created_at    TEXT NOT NULL
 );
 """
 
@@ -101,6 +129,9 @@ class Database:
             "ALTER TABLE bets ADD COLUMN outcome_type TEXT",
             "ALTER TABLE bets ADD COLUMN outcome_round INTEGER",
             "ALTER TABLE user_settings ADD COLUMN currency TEXT",
+            "ALTER TABLE bets ADD COLUMN co_user_id INTEGER",
+            "ALTER TABLE bets ADD COLUMN is_collab INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE bet_legs ADD COLUMN added_by INTEGER",
         ):
             try:
                 await self._conn.execute(statement)
@@ -129,13 +160,16 @@ class Database:
         opponent_pick: Optional[str] = None,
         outcome_type: Optional[str] = None,
         outcome_round: Optional[int] = None,
+        co_user_id: Optional[int] = None,
+        is_collab: bool = False,
     ) -> int:
         cursor = await self._conn.execute(
             """
             INSERT INTO bets (user_id, guild_id, channel_id, sport, event, bet_title,
                                units, odds, status, created_at, stake_gbp, returns_gbp,
-                               fighter_pick, opponent_pick, outcome_type, outcome_round)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+                               fighter_pick, opponent_pick, outcome_type, outcome_round,
+                               co_user_id, is_collab)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -153,6 +187,8 @@ class Database:
                 opponent_pick,
                 outcome_type,
                 outcome_round,
+                co_user_id,
+                1 if is_collab else 0,
             ),
         )
         await self._conn.commit()
@@ -171,13 +207,23 @@ class Database:
         await self._conn.commit()
 
     async def delete_bet(self, bet_id: int) -> None:
+        await self._conn.execute("DELETE FROM bet_legs WHERE bet_id = ?", (bet_id,))
         await self._conn.execute("DELETE FROM bets WHERE id = ?", (bet_id,))
         await self._conn.commit()
 
     async def delete_bets_for_event(self, event: str, sport: str, user_id: int) -> None:
+        cursor = await self._conn.execute(
+            "SELECT id FROM bets WHERE event = ? AND sport = ? "
+            "AND (user_id = ? OR co_user_id = ?)",
+            (event, sport, user_id, user_id),
+        )
+        ids = [r["id"] for r in await cursor.fetchall()]
+        for bet_id in ids:
+            await self._conn.execute("DELETE FROM bet_legs WHERE bet_id = ?", (bet_id,))
         await self._conn.execute(
-            "DELETE FROM bets WHERE event = ? AND sport = ? AND user_id = ?",
-            (event, sport, user_id),
+            "DELETE FROM bets WHERE event = ? AND sport = ? "
+            "AND (user_id = ? OR co_user_id = ?)",
+            (event, sport, user_id, user_id),
         )
         await self._conn.commit()
 
@@ -214,23 +260,26 @@ class Database:
     async def get_all_bets(self, sport: str, user_id: Optional[int] = None) -> list[dict[str, Any]]:
         """user_id=None returns every bet for that sport regardless of owner
         -- only used internally (e.g. re-registering persistent button
-        views on startup), never to show one person another's data."""
+        views on startup), never to show one person another's data.
+        When user_id is set, includes collab slips where they are co-author."""
         if user_id is None:
             cursor = await self._conn.execute(
                 "SELECT * FROM bets WHERE sport = ? ORDER BY id DESC", (sport,)
             )
         else:
             cursor = await self._conn.execute(
-                "SELECT * FROM bets WHERE sport = ? AND user_id = ? ORDER BY id DESC",
-                (sport, user_id),
+                "SELECT * FROM bets WHERE sport = ? AND (user_id = ? OR co_user_id = ?) "
+                "ORDER BY id DESC",
+                (sport, user_id, user_id),
             )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
     async def get_bets_for_event(self, event: str, sport: str, user_id: int) -> list[dict[str, Any]]:
         cursor = await self._conn.execute(
-            "SELECT * FROM bets WHERE event = ? AND sport = ? AND user_id = ? ORDER BY id DESC",
-            (event, sport, user_id),
+            "SELECT * FROM bets WHERE event = ? AND sport = ? "
+            "AND (user_id = ? OR co_user_id = ?) ORDER BY id DESC",
+            (event, sport, user_id, user_id),
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
@@ -273,8 +322,8 @@ class Database:
     async def get_distinct_events(self, sport: str, user_id: int) -> list[str]:
         cursor = await self._conn.execute(
             "SELECT DISTINCT event FROM bets WHERE event IS NOT NULL AND event != '' "
-            "AND sport = ? AND user_id = ? ORDER BY id DESC",
-            (sport, user_id),
+            "AND sport = ? AND (user_id = ? OR co_user_id = ?) ORDER BY id DESC",
+            (sport, user_id, user_id),
         )
         rows = await cursor.fetchall()
         return [r["event"] for r in rows]
@@ -503,14 +552,23 @@ class Database:
         fighter_pick: Optional[str] = None,
         outcome_type: Optional[str] = None,
         outcome_round: Optional[int] = None,
+        added_by: Optional[int] = None,
     ) -> int:
         cursor = await self._conn.execute(
             """
             INSERT INTO bet_legs (bet_id, leg_index, description, fighter_pick,
-                                   outcome_type, outcome_round, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                                   outcome_type, outcome_round, status, added_by)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
             """,
-            (bet_id, leg_index, description, fighter_pick, outcome_type, outcome_round),
+            (
+                bet_id,
+                leg_index,
+                description,
+                fighter_pick,
+                outcome_type,
+                outcome_round,
+                added_by,
+            ),
         )
         await self._conn.commit()
         return cursor.lastrowid
@@ -522,9 +580,152 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    def user_can_access_bet(self, bet: dict[str, Any], user_id: int) -> bool:
+        return bet.get("user_id") == user_id or bet.get("co_user_id") == user_id
+
+    # ---------- collab sessions (shared slip draft) ----------
+
+    async def create_collab_session(
+        self,
+        *,
+        code: str,
+        host_user_id: int,
+        event: Optional[str],
+        guild_id: Optional[int],
+        channel_id: Optional[int],
+    ) -> int:
+        cursor = await self._conn.execute(
+            """
+            INSERT INTO collab_sessions
+                (code, event, host_user_id, partner_user_id, guild_id, channel_id,
+                 message_id, status, created_at)
+            VALUES (?, ?, ?, NULL, ?, ?, NULL, 'open', ?)
+            """,
+            (
+                code.upper(),
+                event,
+                host_user_id,
+                guild_id,
+                channel_id,
+                datetime.datetime.utcnow().isoformat(),
+            ),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def get_collab_session(self, session_id: int) -> Optional[dict[str, Any]]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM collab_sessions WHERE id = ?", (session_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_collab_session_by_code(self, code: str) -> Optional[dict[str, Any]]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM collab_sessions WHERE code = ?", (code.upper().strip(),)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def set_collab_message_id(self, session_id: int, message_id: int) -> None:
+        await self._conn.execute(
+            "UPDATE collab_sessions SET message_id = ? WHERE id = ?",
+            (message_id, session_id),
+        )
+        await self._conn.commit()
+
+    async def join_collab_session(self, session_id: int, partner_user_id: int) -> bool:
+        """Attach partner if session is open and empty. Returns False if unavailable."""
+        session = await self.get_collab_session(session_id)
+        if not session or session["status"] != "open":
+            return False
+        if session["partner_user_id"] is not None:
+            return False
+        if session["host_user_id"] == partner_user_id:
+            return False
+        await self._conn.execute(
+            "UPDATE collab_sessions SET partner_user_id = ? WHERE id = ? "
+            "AND partner_user_id IS NULL AND status = 'open'",
+            (partner_user_id, session_id),
+        )
+        await self._conn.commit()
+        refreshed = await self.get_collab_session(session_id)
+        return bool(refreshed and refreshed.get("partner_user_id") == partner_user_id)
+
+    async def set_collab_status(self, session_id: int, status: str) -> None:
+        await self._conn.execute(
+            "UPDATE collab_sessions SET status = ? WHERE id = ?",
+            (status, session_id),
+        )
+        await self._conn.commit()
+
+    async def add_collab_leg(
+        self,
+        session_id: int,
+        user_id: int,
+        description: str,
+        *,
+        fighter_pick: Optional[str] = None,
+        outcome_type: Optional[str] = None,
+        outcome_round: Optional[int] = None,
+    ) -> int:
+        cursor = await self._conn.execute(
+            "SELECT COALESCE(MAX(leg_index), -1) AS m FROM collab_legs WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        next_index = int(row["m"]) + 1 if row else 0
+        cursor = await self._conn.execute(
+            """
+            INSERT INTO collab_legs
+                (session_id, user_id, leg_index, description, fighter_pick,
+                 outcome_type, outcome_round, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                user_id,
+                next_index,
+                description,
+                fighter_pick,
+                outcome_type,
+                outcome_round,
+                datetime.datetime.utcnow().isoformat(),
+            ),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def get_collab_legs(self, session_id: int) -> list[dict[str, Any]]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM collab_legs WHERE session_id = ? ORDER BY leg_index",
+            (session_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def clear_collab_legs_for_user(self, session_id: int, user_id: int) -> None:
+        await self._conn.execute(
+            "DELETE FROM collab_legs WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id),
+        )
+        await self._conn.commit()
+
     async def update_leg_status(self, leg_id: int, status: str) -> None:
         await self._conn.execute(
             "UPDATE bet_legs SET status = ? WHERE id = ?", (status, leg_id)
+        )
+        await self._conn.commit()
+
+    async def update_leg_description(self, leg_id: int, description: str) -> None:
+        await self._conn.execute(
+            "UPDATE bet_legs SET description = ? WHERE id = ?", (description, leg_id)
+        )
+        await self._conn.commit()
+
+    async def update_bet_title(self, bet_id: int, bet_title: str) -> None:
+        await self._conn.execute(
+            "UPDATE bets SET bet_title = ? WHERE id = ?", (bet_title, bet_id)
         )
         await self._conn.commit()
 
@@ -547,9 +748,9 @@ class Database:
         for what's really the same card."""
         if event:
             cursor = await self._conn.execute(
-                "SELECT * FROM bets WHERE sport = ? AND user_id = ? AND status = 'pending' "
-                "AND event = ? ORDER BY id DESC",
-                (sport, user_id, event),
+                "SELECT * FROM bets WHERE sport = ? AND (user_id = ? OR co_user_id = ?) "
+                "AND status = 'pending' AND event = ? ORDER BY id DESC",
+                (sport, user_id, user_id, event),
             )
             exact = [dict(r) for r in await cursor.fetchall()]
 
@@ -557,9 +758,9 @@ class Database:
 
             seen = {b["id"] for b in exact}
             cursor_all = await self._conn.execute(
-                "SELECT * FROM bets WHERE sport = ? AND user_id = ? AND status = 'pending' "
-                "ORDER BY id DESC",
-                (sport, user_id),
+                "SELECT * FROM bets WHERE sport = ? AND (user_id = ? OR co_user_id = ?) "
+                "AND status = 'pending' ORDER BY id DESC",
+                (sport, user_id, user_id),
             )
             for row in await cursor_all.fetchall():
                 b = dict(row)
@@ -573,9 +774,9 @@ class Database:
             return exact
         else:
             cursor = await self._conn.execute(
-                "SELECT * FROM bets WHERE sport = ? AND user_id = ? AND status = 'pending' "
-                "ORDER BY id DESC",
-                (sport, user_id),
+                "SELECT * FROM bets WHERE sport = ? AND (user_id = ? OR co_user_id = ?) "
+                "AND status = 'pending' ORDER BY id DESC",
+                (sport, user_id, user_id),
             )
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]

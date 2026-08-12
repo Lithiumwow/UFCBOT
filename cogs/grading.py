@@ -26,20 +26,23 @@ from betting_math import get_user_settings
 from checks import is_admin
 from embeds import build_bet_embed
 from leg_rematch import rematch_bets_to_card
-from views import BetView
+from prop_play_map import rebuild_description_from_stored
+from views import BetView, EditBetModal
 
 log = logging.getLogger("ufc-bet-bot.grading")
 
 
 def _bet_label(bet: dict) -> str:
-    """Short label for select menus -- '#12 · Event · first leg…'."""
+    """Short label for select menus -- '#12 · Event · first leg… · WON'."""
     title = (bet.get("bet_title") or "Untitled").splitlines()[0]
     if len(title) > 40:
         title = title[:37] + "…"
     event = bet.get("event") or "No event"
     if len(event) > 28:
         event = event[:25] + "…"
-    return f"#{bet['id']} · {event} · {title}"[:100]
+    status = bet.get("status") or "pending"
+    status_suffix = "" if status == "pending" else f" · {status.upper()}"
+    return f"#{bet['id']} · {event} · {title}{status_suffix}"[:100]
 
 
 class GradeResultView(discord.ui.View):
@@ -117,10 +120,93 @@ class GradeResultView(discord.ui.View):
     async def void(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._settle(interaction, "void")
 
+    @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger)
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"⚠️ Permanently delete bet **#{self.bet_id}**? This can't be undone.",
+            embed=None,
+            view=GradeDeleteConfirmView(bet_id=self.bet_id, invoker_id=self.invoker_id),
+        )
+
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             content="Cancelled — nothing graded.", embed=None, view=None
+        )
+        self.stop()
+
+
+class GradeDeleteConfirmView(discord.ui.View):
+    """Shown when Delete is pressed from the /grade flow -- same
+    confirm-before-permanently-wiping-it safety pattern as the normal
+    BetView Delete button."""
+
+    def __init__(self, *, bet_id: int, invoker_id: int):
+        super().__init__(timeout=30)
+        self.bet_id = bet_id
+        self.invoker_id = invoker_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "🚫 This isn't your grading prompt.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="✅ Confirm Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = interaction.client.db  # type: ignore[attr-defined]
+        bet = await db.get_bet(self.bet_id)
+        if bet is None:
+            await interaction.response.edit_message(
+                content=f"Bet #{self.bet_id} no longer exists.", embed=None, view=None
+            )
+            self.stop()
+            return
+        if interaction.user.id != bet["user_id"] and interaction.user.id != bet.get("co_user_id"):
+            await interaction.response.send_message(
+                "🚫 You can only delete your own slips.", ephemeral=True
+            )
+            return
+
+        await db.delete_bet(self.bet_id)
+
+        # Best-effort: also update the original bet message so it doesn't
+        # sit there looking gradeable/settleable forever.
+        if bet.get("channel_id") and bet.get("message_id"):
+            try:
+                channel = interaction.client.get_channel(
+                    bet["channel_id"]
+                ) or await interaction.client.fetch_channel(bet["channel_id"])
+                msg = await channel.fetch_message(bet["message_id"])
+                await msg.edit(content="🗑️ *This bet was deleted.*", embed=None, view=None)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        await interaction.response.edit_message(
+            content=f"🗑️ Bet **#{self.bet_id}** deleted completely.", embed=None, view=None
+        )
+        self.stop()
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = interaction.client.db  # type: ignore[attr-defined]
+        bet = await db.get_bet(self.bet_id)
+        if bet is None:
+            await interaction.response.edit_message(
+                content=f"Bet #{self.bet_id} no longer exists.", embed=None, view=None
+            )
+            self.stop()
+            return
+        unit_value, currency = await get_user_settings(db, interaction.user.id)
+        embed = build_bet_embed(
+            bet, unit_value=unit_value, currency=currency, user=interaction.user
+        )
+        await interaction.response.edit_message(
+            content=f"Grade **bet #{self.bet_id}** — choose a result:",
+            embed=embed,
+            view=GradeResultView(bet_id=self.bet_id, invoker_id=self.invoker_id),
         )
         self.stop()
 
@@ -180,6 +266,57 @@ class GradeSelectView(discord.ui.View):
         return True
 
 
+class EditSelect(discord.ui.Select):
+    def __init__(self, bets: list[dict], invoker_id: int):
+        options = [
+            discord.SelectOption(
+                label=_bet_label(b)[:100],
+                value=str(b["id"]),
+                description=f"{b.get('units') or 1:g}u"
+                + (f" @ {b['odds']:+d}" if b.get("odds") is not None else ""),
+            )
+            for b in bets[:25]
+        ]
+        super().__init__(
+            placeholder="Pick a bet to edit…",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.invoker_id = invoker_id
+
+    async def callback(self, interaction: discord.Interaction):
+        bet_id = int(self.values[0])
+        db = interaction.client.db  # type: ignore[attr-defined]
+        bet = await db.get_bet(bet_id)
+        if bet is None:
+            await interaction.response.send_message(
+                "That bet no longer exists.", ephemeral=True
+            )
+            return
+        if interaction.user.id != bet["user_id"] and interaction.user.id != bet.get("co_user_id"):
+            await interaction.response.send_message(
+                "🚫 You can only edit your own slips.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(EditBetModal(bet))
+
+
+class EditSelectView(discord.ui.View):
+    def __init__(self, bets: list[dict], invoker_id: int):
+        super().__init__(timeout=120)
+        self.invoker_id = invoker_id
+        self.add_item(EditSelect(bets, invoker_id))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "🚫 This isn't your editing prompt.", ephemeral=True
+            )
+            return False
+        return True
+
+
 class GradingCog(commands.Cog):
     # How long to wait after a fight first shows as completed before
     # actually grading it -- ESPN's result text is sometimes incomplete
@@ -231,10 +368,10 @@ class GradingCog(commands.Cog):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         db = self.bot.db  # type: ignore[attr-defined]
-        pending = await db.get_pending_bets("ufc", interaction.user.id)
+        all_bets = await db.get_all_bets("ufc", interaction.user.id)
         current_lower = current.lower()
         choices = []
-        for b in pending:
+        for b in all_bets:
             label = _bet_label(b)
             if current_lower and current_lower not in label.lower() and current not in str(b["id"]):
                 continue
@@ -287,40 +424,115 @@ class GradingCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            if bet["status"] != "pending":
-                await interaction.response.send_message(
-                    f"Bet **#{bid}** is already graded as **{bet['status']}**. "
-                    "Use Won/Loss/Void on the original card if you need to change it.",
-                    ephemeral=True,
-                )
-                return
 
             unit_value, currency = await get_user_settings(db, interaction.user.id)
             embed = build_bet_embed(
                 bet, unit_value=unit_value, currency=currency, user=interaction.user
             )
+            already_graded_note = (
+                f" (currently **{bet['status'].upper()}** — this will change it)"
+                if bet["status"] != "pending" else ""
+            )
             await interaction.response.send_message(
-                content=f"Grade **bet #{bid}** — choose a result:",
+                content=f"Grade **bet #{bid}**{already_graded_note} — choose a result:",
                 embed=embed,
                 view=GradeResultView(bet_id=bid, invoker_id=interaction.user.id),
             )
             return
 
-        pending = await db.get_pending_bets("ufc", interaction.user.id, event=event)
-        if not pending:
+        all_bets = await db.get_all_bets("ufc", interaction.user.id)
+        if event:
+            from card_data import _event_match_score
+            all_bets = [
+                b for b in all_bets
+                if (b.get("event") or "") and _event_match_score(event, b["event"]) >= 70
+            ]
+        if not all_bets:
             scope = f" for **{event}**" if event else ""
             await interaction.response.send_message(
-                f"No pending UFC slips{scope}. Nothing to grade.", ephemeral=True
+                f"No UFC slips{scope} found. Nothing to grade.", ephemeral=True
+            )
+            return
+
+        # Pending first (most likely to actually need grading), so they
+        # can't get crowded out of the 25-option dropdown limit by a long
+        # history of already-graded bets.
+        all_bets.sort(key=lambda b: 0 if b.get("status") == "pending" else 1)
+
+        await interaction.response.send_message(
+            content=(
+                f"**{len(all_bets)}** slip(s)"
+                + (f" for **{event}**" if event else "")
+                + " — pick one to grade (already-graded ones are marked, picking one changes its result):"
+            ),
+            view=GradeSelectView(all_bets, interaction.user.id),
+        )
+
+    # ---------- /edit-bet ----------
+
+    @app_commands.command(
+        name="edit-bet",
+        description="Edit a bet you've already logged (event, legs, units, odds)",
+    )
+    @is_admin()
+    @app_commands.describe(
+        bet_id="Optional: edit this bet id directly (autocompletes from your slips)",
+        event="Optional: only list slips for this event",
+    )
+    @app_commands.autocomplete(bet_id=bet_id_autocomplete, event=event_autocomplete)
+    async def edit_bet(
+        self,
+        interaction: discord.Interaction,
+        bet_id: str | None = None,
+        event: str | None = None,
+    ):
+        db = self.bot.db  # type: ignore[attr-defined]
+
+        if bet_id is not None:
+            try:
+                bid = int(bet_id)
+            except ValueError:
+                await interaction.response.send_message(
+                    "⚠️ `bet_id` must be a number.", ephemeral=True
+                )
+                return
+
+            bet = await db.get_bet(bid)
+            if bet is None:
+                await interaction.response.send_message(
+                    f"No bet found with id **#{bid}**.", ephemeral=True
+                )
+                return
+            if interaction.user.id != bet["user_id"] and interaction.user.id != bet.get("co_user_id"):
+                await interaction.response.send_message(
+                    "🚫 You can only edit your own slips.", ephemeral=True
+                )
+                return
+
+            await interaction.response.send_modal(EditBetModal(bet))
+            return
+
+        all_bets = await db.get_all_bets("ufc", interaction.user.id)
+        if event:
+            from card_data import _event_match_score
+            all_bets = [
+                b for b in all_bets
+                if (b.get("event") or "") and _event_match_score(event, b["event"]) >= 70
+            ]
+        if not all_bets:
+            scope = f" for **{event}**" if event else ""
+            await interaction.response.send_message(
+                f"No UFC slips{scope} found. Nothing to edit.", ephemeral=True
             )
             return
 
         await interaction.response.send_message(
             content=(
-                f"**{len(pending)}** pending slip(s)"
+                f"**{len(all_bets)}** slip(s)"
                 + (f" for **{event}**" if event else "")
-                + " — pick one to grade:"
+                + " — pick one to edit:"
             ),
-            view=GradeSelectView(pending, interaction.user.id),
+            view=EditSelectView(all_bets, interaction.user.id),
         )
 
     # ---------- /rescan ----------
@@ -460,6 +672,86 @@ class GradingCog(commands.Cog):
             "Rescan of '%s' (requested by %s): %d correction(s), %d unmatched, %d still pending.",
             event, interaction.user, len(corrections), len(unmatched), still_pending,
         )
+
+    # ---------- /fix-descriptions ----------
+
+    @app_commands.command(
+        name="fix-descriptions",
+        description="Rebuild leg/bet text for already-logged bets using the current formatting rules",
+    )
+    @is_admin()
+    @app_commands.describe(
+        event="Which event to fix (autocompletes from events you've logged bets against)"
+    )
+    @app_commands.autocomplete(event=event_autocomplete)
+    async def fix_descriptions(self, interaction: discord.Interaction, event: str):
+        """Fixing how NEW bets get their description text built (in
+        prop_play_map.py) doesn't retroactively rewrite text already
+        stored for bets logged before that fix existed. This rebuilds
+        that stored text -- description on each structured leg, and
+        bet_title on the bet itself -- using the current rules, entirely
+        from already-stored fighter_pick/outcome_type/outcome_round
+        (no live FightOdds data needed)."""
+        await interaction.response.defer()
+        db = self.bot.db  # type: ignore[attr-defined]
+
+        bets = await db.get_bets_for_event_matching(event, "ufc", interaction.user.id)
+        if not bets:
+            await interaction.followup.send(f"No bets found for **{event}**.", ephemeral=True)
+            return
+
+        try:
+            fights = await card_data.fetch_fights_for_event(event)
+        except Exception:
+            fights = []
+
+        fixed_legs = 0
+        fixed_bets = 0
+
+        for bet in bets:
+            legs = await db.get_legs_for_bet(bet["id"])
+            any_leg_changed = False
+
+            for leg in legs:
+                fighter_pick = leg.get("fighter_pick")
+                outcome_type = leg.get("outcome_type")
+                if not fighter_pick or not outcome_type:
+                    continue  # free-text leg, nothing to rebuild
+
+                match = card_data.match_fighter_on_card(fighter_pick, fights) if fights else None
+                if match:
+                    fighter_a, fighter_b = match[0], match[1]
+                else:
+                    fighter_a, fighter_b = fighter_pick, ""  # best effort without card data
+
+                new_description = rebuild_description_from_stored(
+                    fighter_pick=fighter_pick, outcome_type=outcome_type,
+                    outcome_round=leg.get("outcome_round"),
+                    fighter_a=fighter_a, fighter_b=fighter_b,
+                    current_description=leg["description"],
+                )
+                if new_description != leg["description"]:
+                    await db.update_leg_description(leg["id"], new_description)
+                    fixed_legs += 1
+                    any_leg_changed = True
+
+            if any_leg_changed:
+                fresh_legs = await db.get_legs_for_bet(bet["id"])
+                new_bet_title = "\n".join(l["description"] for l in fresh_legs)
+                await db.update_bet_title(bet["id"], new_bet_title)
+                await self._redraw_bet_message(bet["id"])
+                fixed_bets += 1
+
+        if fixed_legs:
+            await interaction.followup.send(
+                f"✏️ Rebuilt **{fixed_legs}** leg description(s) across **{fixed_bets}** bet(s) "
+                f"for **{event}**."
+            )
+        else:
+            await interaction.followup.send(
+                f"Nothing to fix for **{event}** — every structured leg's text already matches "
+                "the current formatting rules."
+            )
 
     # ---------- /event-start, /event-end ----------
 

@@ -55,7 +55,7 @@ def _leg_lines(
     bets: list[dict[str, Any]], unit_value: float, singular_label: str | None = None
 ) -> list[str]:
     """
-    Straights (1 leg): compact single line, as before.
+    ML (1 leg): compact single line, as before.
     Multi-leg bets (2 Legs / Parlays): numbered block with each leg on its
     own line, so a 3-leg parlay doesn't run together as one wrapped line.
     """
@@ -69,12 +69,15 @@ def _leg_lines(
 
         if len(legs) > 1 and singular_label:
             counter += 1
+            prefix = "🤝 " if b.get("is_collab") else ""
             leg_block = "\n".join(f"▸ {leg}" for leg in legs)
             lines.append(
-                f"**{singular_label} {counter}**\n{leg_block}\n`{odds_str}`  ·  {units:g}u  {emoji}"
+                f"**{prefix}{singular_label} {counter}**\n{leg_block}\n`{odds_str}`  ·  {units:g}u  {emoji}"
             )
         else:
             label = " + ".join(legs) if len(legs) > 1 else (legs[0] if legs else "Untitled bet")
+            if b.get("is_collab"):
+                label = f"🤝 {label}"
             lines.append(f"▸ {label}  `{odds_str}`  ·  {units:g}u  {emoji}")
     return lines
 
@@ -104,7 +107,7 @@ def _get_legs(bet: dict[str, Any]) -> list[str]:
 
 def _leg_category(n: int) -> str:
     if n <= 1:
-        return "Straights"
+        return "ML"
     if n == 2:
         return "2 Legs"
     return "Parlays"
@@ -117,7 +120,7 @@ def _leg_category_singular(n: int) -> str:
     return "Parlay"
 
 
-CATEGORY_ORDER = ["Straights", "2 Legs", "Parlays"]
+CATEGORY_ORDER = ["ML", "2 Legs", "Parlays"]
 
 
 def build_bet_embed(
@@ -126,6 +129,7 @@ def build_bet_embed(
     unit_value: float,
     currency: str,
     user: Optional[discord.abc.User] = None,
+    co_user: Optional[discord.abc.User] = None,
 ) -> discord.Embed:
     status = bet.get("status", "pending")
     units = bet.get("units", 1.0)
@@ -138,13 +142,22 @@ def build_bet_embed(
     else:
         title_text = f"{_leg_category_singular(len(legs))} · {len(legs)} legs"
 
+    if bet.get("is_collab"):
+        title_text = f"🤝 Collab · {title_text}"
+
     embed = discord.Embed(
         title=f"{STATUS_EMOJI.get(status, '🥊')}  {title_text}",
         description=f"🗓️ **{bet.get('event') or 'Event TBD'}**",
         color=STATUS_COLOR.get(status, discord.Color.blurple()),
     )
 
-    if user is not None:
+    if user is not None and co_user is not None:
+        embed.set_author(
+            name=f"{user.display_name} + {co_user.display_name} · Collab Slip",
+            icon_url=user.display_avatar.url,
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+    elif user is not None:
         embed.set_author(
             name=f"{user.display_name} · Bet Slip",
             icon_url=user.display_avatar.url,
@@ -354,7 +367,7 @@ def build_results_embed(
             ordered = ordered[-bet_list_limit:]
             list_title = f"Last {bet_list_limit} Plays"
 
-        grouped: dict[str, list[dict[str, Any]]] = {"Straights": [], "2 Legs": [], "Parlays": []}
+        grouped: dict[str, list[dict[str, Any]]] = {"ML": [], "2 Legs": [], "Parlays": []}
         for b in ordered:
             grouped[_leg_category(len(_get_legs(b)))].append(b)
 
@@ -369,8 +382,7 @@ def build_results_embed(
 
             singular = singular_labels.get(category)
             # Multi-leg bets get a blank line between each numbered block so
-            # separate parlays don't run into each other; straights stay
-            # tightly packed since each is just one line.
+            # separate parlays don't run into each other; ML stays tightly packed.
             sep = "\n\n" if singular else "\n"
             chunks = _chunk_lines(
                 _leg_lines(group_bets, unit_value, singular_label=singular), sep=sep

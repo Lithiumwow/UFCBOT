@@ -24,9 +24,19 @@ async def _build_slip_embed(client: discord.Client, bet: dict) -> discord.Embed:
             bettor = await client.fetch_user(bet["user_id"])
         except discord.NotFound:
             bettor = None
+    co_user = None
+    if bet.get("co_user_id"):
+        co_user = client.get_user(bet["co_user_id"])
+        if co_user is None:
+            try:
+                co_user = await client.fetch_user(bet["co_user_id"])
+            except discord.NotFound:
+                co_user = None
     db = client.db  # type: ignore[attr-defined]
     unit_value, currency = await get_user_settings(db, bet["user_id"])
-    return build_bet_embed(bet, unit_value=unit_value, currency=currency, user=bettor)
+    return build_bet_embed(
+        bet, unit_value=unit_value, currency=currency, user=bettor, co_user=co_user
+    )
 
 
 async def _build_card_embed(
@@ -120,7 +130,7 @@ class BetView(discord.ui.View):
                 "This bet no longer exists in the database.", ephemeral=True
             )
             return False
-        if interaction.user.id != bet["user_id"]:
+        if interaction.user.id != bet["user_id"] and interaction.user.id != bet.get("co_user_id"):
             await interaction.response.send_message(
                 "🚫 These aren't your buttons to press -- this is someone else's bet.",
                 ephemeral=True,
@@ -579,7 +589,7 @@ class ConfirmDeleteView(discord.ui.View):
                 "This bet no longer exists in the database.", ephemeral=True
             )
             return False
-        if interaction.user.id != bet["user_id"]:
+        if interaction.user.id != bet["user_id"] and interaction.user.id != bet.get("co_user_id"):
             await interaction.response.send_message(
                 "🚫 This isn't your bet to delete.", ephemeral=True
             )

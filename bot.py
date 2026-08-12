@@ -53,6 +53,7 @@ class UFCBetBot(commands.Bot):
 
         # Load cogs
         await self.load_extension("cogs.bets")
+        await self.load_extension("cogs.collab")
         await self.load_extension("cogs.results")
         await self.load_extension("cogs.results_nba")
         await self.load_extension("cogs.grading")
@@ -207,7 +208,7 @@ class UFCBetBot(commands.Bot):
             )
             return None, None
 
-        if bet["user_id"] != message.author.id:
+        if bet["user_id"] != message.author.id and bet.get("co_user_id") != message.author.id:
             await message.reply(
                 "🚫 This isn't your bet -- you can only edit or delete bets you logged yourself.",
                 mention_author=False,
