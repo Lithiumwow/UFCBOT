@@ -10,6 +10,7 @@ import chart
 from betting_math import get_user_settings
 from checks import is_admin
 from embeds import build_pl_embed
+from views import CardShareView
 
 
 class PLCog(commands.Cog):
@@ -59,7 +60,7 @@ class PLCog(commands.Cog):
 
         # Defer immediately -- chart rendering can exceed Discord's 3s window,
         # which makes the whole reply fail (no embed AND no graph).
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         unit_value, currency = await get_user_settings(db, interaction.user.id)
 
@@ -67,7 +68,8 @@ class PLCog(commands.Cog):
             bets = await db.get_bets_for_event_matching(event, "ufc", interaction.user.id)  # type: ignore[arg-type]
             if not bets:
                 await interaction.followup.send(
-                    f"No UFC bets found for **{event}**."
+                    f"No UFC bets found for **{event}**.",
+                    ephemeral=True,
                 )
                 return
             embed = build_pl_embed(
@@ -78,6 +80,7 @@ class PLCog(commands.Cog):
                 icon_url=interaction.user.display_avatar.url,
             )
             chart_title = f"Units — {event}"
+            share_event = event
         else:
             bets = await db.get_all_bets("ufc", interaction.user.id)
             embed = build_pl_embed(
@@ -89,6 +92,7 @@ class PLCog(commands.Cog):
                 include_event_breakdown=True,
             )
             chart_title = "Cumulative Units — Overall"
+            share_event = None
 
         files: list[discord.File] = []
         chart_bytes = chart.build_profit_chart(
@@ -99,7 +103,17 @@ class PLCog(commands.Cog):
             embed.set_image(url="attachment://pl_curve.png")
             files.append(image_file)
 
-        await interaction.followup.send(embed=embed, files=files)
+        await interaction.followup.send(
+            embed=embed,
+            files=files,
+            view=CardShareView(
+                invoker_id=interaction.user.id,
+                kind="pl",
+                event=share_event,
+                pl_scope=scope.value,
+            ),
+            ephemeral=True,
+        )
 
 
 async def setup(bot: commands.Bot):

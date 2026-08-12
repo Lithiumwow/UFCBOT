@@ -11,10 +11,17 @@ Persistence works by:
 """
 from __future__ import annotations
 
+import io
+import re
+
 import discord
 
+import card_data
+import chart
 from betting_math import get_user_settings
-from embeds import build_bet_embed, build_results_embed
+from embeds import build_bet_embed, build_pl_embed, build_results_embed
+from spreadsheet_image import build_event_recap_image
+from leg_rematch import rematch_bets_to_card
 
 
 async def _build_slip_embed(client: discord.Client, bet: dict) -> discord.Embed:
@@ -60,6 +67,108 @@ async def _build_card_embed(
         icon_url=icon,
         include_bet_list=True,
     )
+
+
+async def _build_pl_share(
+    client: discord.Client, *, user_id: int, scope: str, event: str | None
+) -> tuple[discord.Embed, discord.File | None, str] | None:
+    """Rebuild P/L embed (+ optional chart file) for sharing."""
+    db = client.db  # type: ignore[attr-defined]
+    unit_value, currency = await get_user_settings(db, user_id)
+    bettor = client.get_user(user_id)
+    if bettor is None:
+        try:
+            bettor = await client.fetch_user(user_id)
+        except discord.NotFound:
+            bettor = None
+    icon = bettor.display_avatar.url if bettor is not None else None
+
+    if scope == "event":
+        if not event:
+            return None
+        bets = await db.get_bets_for_event_matching(event, "ufc", user_id)
+        if not bets:
+            return None
+        embed = build_pl_embed(
+            title=f"P/L — {event}",
+            bets=bets,
+            unit_value=unit_value,
+            currency=currency,
+            icon_url=icon,
+        )
+        chart_title = f"Units — {event}"
+        ok_label = f"P/L · {event}"
+    else:
+        bets = await db.get_all_bets("ufc", user_id)
+        embed = build_pl_embed(
+            title="P/L — Overall (All-Time UFC)",
+            bets=bets,
+            unit_value=unit_value,
+            currency=currency,
+            icon_url=icon,
+            include_event_breakdown=True,
+        )
+        chart_title = "Cumulative Units — Overall"
+        ok_label = "P/L · Overall"
+
+    chart_file = None
+    chart_bytes = chart.build_profit_chart(
+        bets, unit_value, currency, in_units=True, title=chart_title
+    )
+    if chart_bytes:
+        chart_file = discord.File(io.BytesIO(chart_bytes), filename="pl_curve.png")
+        embed.set_image(url="attachment://pl_curve.png")
+    return embed, chart_file, ok_label
+
+
+async def _build_sheet_share(
+    client: discord.Client, *, event: str, user_id: int
+) -> tuple[str, discord.File, str] | None:
+    """Rebuild spreadsheet recap image for sharing."""
+    db = client.db  # type: ignore[attr-defined]
+    bets = await db.get_bets_for_event_matching(event, "ufc", user_id)
+    if not bets:
+        return None
+
+    try:
+        fights = await card_data.fetch_fights_for_event(event)
+    except Exception:
+        fights = []
+
+    if fights:
+        try:
+            await rematch_bets_to_card(db, bets, fights)
+        except Exception:
+            pass
+        for bet in bets:
+            refreshed = await db.get_bet(bet["id"])
+            if refreshed:
+                bet.update(refreshed)
+
+    legs_by_bet_id = {bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets}
+    event_date = None
+    for ev in getattr(client, "cached_events", []) or []:
+        if ev.get("name") == event or card_data._event_match_score(event, ev.get("name") or "") >= 70:
+            try:
+                event_date = f"{ev['date'].day} {ev['date']:%b %Y}"
+            except Exception:
+                event_date = None
+            break
+
+    unit_value, currency = await get_user_settings(db, user_id)
+    image_bytes = build_event_recap_image(
+        event_name=event,
+        event_date=event_date,
+        bets=bets,
+        legs_by_bet_id=legs_by_bet_id,
+        fights=fights,
+        unit_value=unit_value,
+        currency=currency,
+    )
+    safe_name = re.sub(r"[^\w\-]+", "_", event)[:60]
+    content = f"📊 Recap for **{event}** ({len(bets)} bet(s))."
+    file = discord.File(io.BytesIO(image_bytes), filename=f"{safe_name}.png")
+    return content, file, f"sheet **{event}**"
 
 
 async def _channels_user_can_share(
@@ -200,13 +309,23 @@ class BetView(discord.ui.View):
 
 
 class CardShareView(discord.ui.View):
-    """Share button attached to `/card` results."""
+    """Share button for ephemeral /card, /pl, or /spread-sheet replies."""
 
-    def __init__(self, *, event: str, invoker_id: int, sport: str = "ufc"):
+    def __init__(
+        self,
+        *,
+        invoker_id: int,
+        kind: str = "card",
+        event: str | None = None,
+        sport: str = "ufc",
+        pl_scope: str | None = None,
+    ):
         super().__init__(timeout=600)
-        self.event = event
         self.invoker_id = invoker_id
+        self.kind = kind  # card | pl | sheet
+        self.event = event
         self.sport = sport
+        self.pl_scope = pl_scope or "overall"
 
         share_btn = discord.ui.Button(
             label="📤 Share",
@@ -228,11 +347,19 @@ class CardShareView(discord.ui.View):
         view = await ShareDestinationView.create(
             invoker_id=interaction.user.id,
             interaction=interaction,
-            card_event=self.event,
+            card_event=self.event if self.kind == "card" else None,
             card_sport=self.sport,
+            pl_scope=self.pl_scope if self.kind == "pl" else None,
+            pl_event=self.event if self.kind == "pl" else None,
+            sheet_event=self.event if self.kind == "sheet" else None,
         )
+        labels = {
+            "card": "card (results summary for this event)",
+            "pl": "P/L chart",
+            "sheet": "spread-sheet recap image",
+        }
         await interaction.followup.send(
-            "📤 **Share card** (results summary for this event)\n"
+            f"📤 **Share {labels.get(self.kind, 'result')}**\n"
             "• Use the channel menu for **this server**, or\n"
             "• Pick **another server**, then a channel.",
             view=view,
@@ -251,11 +378,17 @@ class ShareDestinationView(discord.ui.View):
         bet_id: int | None = None,
         card_event: str | None = None,
         card_sport: str = "ufc",
+        pl_scope: str | None = None,
+        pl_event: str | None = None,
+        sheet_event: str | None = None,
     ):
         super().__init__(timeout=180)
         self.bet_id = bet_id
         self.card_event = card_event
         self.card_sport = card_sport
+        self.pl_scope = pl_scope
+        self.pl_event = pl_event
+        self.sheet_event = sheet_event
         self.invoker_id = invoker_id
 
         ch_select = discord.ui.ChannelSelect(
@@ -293,6 +426,9 @@ class ShareDestinationView(discord.ui.View):
         bet_id: int | None = None,
         card_event: str | None = None,
         card_sport: str = "ufc",
+        pl_scope: str | None = None,
+        pl_event: str | None = None,
+        sheet_event: str | None = None,
     ) -> ShareDestinationView:
         other: list[discord.SelectOption] = []
         here = interaction.guild
@@ -316,6 +452,9 @@ class ShareDestinationView(discord.ui.View):
             bet_id=bet_id,
             card_event=card_event,
             card_sport=card_sport,
+            pl_scope=pl_scope,
+            pl_event=pl_event,
+            sheet_event=sheet_event,
             invoker_id=invoker_id,
             other_guild_options=other,
         )
@@ -362,6 +501,11 @@ class ShareDestinationView(discord.ui.View):
                 return
             embed = await _build_slip_embed(interaction.client, bet)
             ok_label = f"bet **#{self.bet_id}**"
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException as e:
+                await self._reply(interaction, f"❌ Failed to post: {e}")
+                return
         elif self.card_event:
             embed = await _build_card_embed(
                 interaction.client,
@@ -373,14 +517,47 @@ class ShareDestinationView(discord.ui.View):
                 await self._reply(interaction, "Couldn't build the card summary.")
                 return
             ok_label = f"card **{self.card_event}**"
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException as e:
+                await self._reply(interaction, f"❌ Failed to post: {e}")
+                return
+        elif self.pl_scope:
+            built = await _build_pl_share(
+                interaction.client,
+                user_id=self.invoker_id,
+                scope=self.pl_scope,
+                event=self.pl_event,
+            )
+            if built is None:
+                await self._reply(interaction, "Couldn't build the P/L summary.")
+                return
+            embed, chart_file, ok_label = built
+            try:
+                if chart_file is not None:
+                    await channel.send(embed=embed, file=chart_file)
+                else:
+                    await channel.send(embed=embed)
+            except discord.HTTPException as e:
+                await self._reply(interaction, f"❌ Failed to post: {e}")
+                return
+        elif self.sheet_event:
+            built = await _build_sheet_share(
+                interaction.client,
+                event=self.sheet_event,
+                user_id=self.invoker_id,
+            )
+            if built is None:
+                await self._reply(interaction, "Couldn't build the sheet image.")
+                return
+            content, image_file, ok_label = built
+            try:
+                await channel.send(content=content, file=image_file)
+            except discord.HTTPException as e:
+                await self._reply(interaction, f"❌ Failed to post: {e}")
+                return
         else:
             await self._reply(interaction, "Nothing to share.")
-            return
-
-        try:
-            await channel.send(embed=embed)
-        except discord.HTTPException as e:
-            await self._reply(interaction, f"❌ Failed to post: {e}")
             return
 
         dest = getattr(channel, "mention", None) or str(channel)
@@ -477,6 +654,9 @@ class ShareDestinationView(discord.ui.View):
             bet_id=self.bet_id,
             card_event=self.card_event,
             card_sport=self.card_sport,
+            pl_scope=self.pl_scope,
+            pl_event=self.pl_event,
+            sheet_event=self.sheet_event,
         )
         try:
             await interaction.edit_original_response(
@@ -503,11 +683,17 @@ class ShareGuildChannelView(discord.ui.View):
         bet_id: int | None = None,
         card_event: str | None = None,
         card_sport: str = "ufc",
+        pl_scope: str | None = None,
+        pl_event: str | None = None,
+        sheet_event: str | None = None,
     ):
         super().__init__(timeout=180)
         self.bet_id = bet_id
         self.card_event = card_event
         self.card_sport = card_sport
+        self.pl_scope = pl_scope
+        self.pl_event = pl_event
+        self.sheet_event = sheet_event
         self.invoker_id = invoker_id
 
         options = [
@@ -566,6 +752,9 @@ class ShareGuildChannelView(discord.ui.View):
             bet_id=self.bet_id,
             card_event=self.card_event,
             card_sport=self.card_sport,
+            pl_scope=self.pl_scope,
+            pl_event=self.pl_event,
+            sheet_event=self.sheet_event,
             invoker_id=self.invoker_id,
             other_guild_options=[],
         )

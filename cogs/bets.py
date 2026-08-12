@@ -268,7 +268,13 @@ class BetsCog(commands.Cog):
         )
         await interaction.response.send_message(
             embed=embed,
-            view=CardShareView(event=event, invoker_id=interaction.user.id, sport="ufc"),
+            view=CardShareView(
+                invoker_id=interaction.user.id,
+                kind="card",
+                event=event,
+                sport="ufc",
+            ),
+            ephemeral=True,
         )
 
     @app_commands.command(
@@ -290,7 +296,7 @@ class BetsCog(commands.Cog):
             )
             return
 
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         try:
             fights = await card_data.fetch_fights_for_event(event)
@@ -345,6 +351,13 @@ class BetsCog(commands.Cog):
                 f"📊 Recap for **{event}** ({len(bets)} bet(s){fight_note}{rematch_note})."
             ),
             file=discord.File(io.BytesIO(image_bytes), filename=f"{safe_name}.png"),
+            view=CardShareView(
+                invoker_id=interaction.user.id,
+                kind="sheet",
+                event=event,
+                sport="ufc",
+            ),
+            ephemeral=True,
         )
 
     # ---------- NBA ----------
