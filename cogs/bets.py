@@ -223,29 +223,37 @@ class BetsCog(commands.Cog):
     @app_commands.command(name="card", description="Show every UFC bet you've logged for a card")
     @is_admin()
     @app_commands.describe(
-        event="Which event's bets to show (optional -- defaults to the next upcoming/live event)"
+        event="Which event to show (defaults to your most recent logged card)"
     )
-    @app_commands.autocomplete(event=ufc_event_autocomplete)
+    @app_commands.autocomplete(event=logged_ufc_event_autocomplete)
     async def card(self, interaction: discord.Interaction, event: str | None = None):
         db = self.bot.db  # type: ignore[attr-defined]
 
         if not event:
-            cached_events = self._upcoming_events()
-            event = (
-                (cached_events[0].get("name") or cached_events[0].get("short_name"))
-                if cached_events
-                else None
-            )
+            # Prefer the latest event this user actually has bets on — not the
+            # next upcoming card (which often has zero logged slips yet).
+            logged = await db.get_distinct_events("ufc", interaction.user.id)
+            event = logged[0] if logged else None
 
         if not event:
             await interaction.response.send_message(
-                "No event specified, and there's no cached upcoming event to default to yet. "
-                "Try again shortly, or pass `event` explicitly.",
+                "You don't have any logged UFC bets yet, so there's no card to show. "
+                "Log one with `/bet-ufc`, or pass `event` explicitly.",
                 ephemeral=True,
             )
             return
 
         bets = await db.get_bets_for_event_matching(event, "ufc", interaction.user.id)
+        if not bets:
+            logged = await db.get_distinct_events("ufc", interaction.user.id)
+            hint = ", ".join(f"**{e}**" for e in logged[:8]) if logged else "(none)"
+            await interaction.response.send_message(
+                f"No bets matched **{event}**.\n"
+                f"Your logged cards: {hint}",
+                ephemeral=True,
+            )
+            return
+
         unit_value, currency = await get_user_settings(db, interaction.user.id)
         embed = build_results_embed(
             title=event,
