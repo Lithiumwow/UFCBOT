@@ -74,6 +74,14 @@ _FIGHT_LEVEL_LABELS = {
 }
 
 
+def short_fighter_name(full: str) -> str:
+    """Last name (or sole token) for compact Discord select labels."""
+    parts = (full or "").strip().split()
+    if not parts:
+        return full or "?"
+    return parts[-1]
+
+
 def _match_fighter(label: str, fighter_a: str, fighter_b: str) -> Optional[str]:
     low = label.lower()
     best: Optional[str] = None
@@ -90,6 +98,85 @@ def _match_fighter(label: str, fighter_a: str, fighter_b: str) -> Optional[str]:
     return best
 
 
+def _abbreviate_prop_phrases(text: str) -> str:
+    """Tighten common FightOdds phrasing so props fit Discord's 100-char label."""
+    out = text
+    subs = (
+        (r"\bwins in rounds?\s+", "R"),
+        (r"\bround\s+(\d)\s*[-–—/]\s*(\d)\b", r"R\1-\2"),
+        (r"\brounds?\s+(\d)\s*[-–—/or]+\s*(\d)\b", r"R\1-\2"),
+        (r"\bKO,\s*TKO\s+or\s+DQ\b", "KO/TKO/DQ"),
+        (r"\bKO/TKO\s+or\s+DQ\b", "KO/TKO/DQ"),
+        (r"\bby\s+Submission\b", "by Sub"),
+        (r"\bUnanimous Decision\b", "UD"),
+        (r"\bSplit Decision\b", "SD"),
+        (r"\binside the distance\b", "ID"),
+        (r"\bgoes the distance\b", "distance"),
+        (r"\bdoes NOT go the distance\b", "not distance"),
+    )
+    for pat, repl in subs:
+        out = re.sub(pat, repl, out, flags=re.I)
+    out = re.sub(r"\s+[·–—-]\s+", " · ", out)
+    out = re.sub(r"\s{2,}", " ", out).strip(" ·")
+    return out
+
+
+def shorten_names_in_text(text: str, fighter_a: str, fighter_b: str) -> str:
+    """Replace full fighter names with last names (longest match first)."""
+    out = text or ""
+    for full in sorted((fighter_a or "", fighter_b or ""), key=len, reverse=True):
+        if not full or " " not in full.strip():
+            continue
+        short = short_fighter_name(full)
+        if short and short != full:
+            out = re.sub(re.escape(full), short, out, flags=re.I)
+    return out
+
+
+def select_option_texts(
+    description: str,
+    *,
+    fighter_a: str,
+    fighter_b: str,
+    category_label: str = "",
+) -> tuple[str, Optional[str]]:
+    """
+    Build Discord SelectOption label + description (100 chars each).
+
+    Discord truncates the primary label — so prefer last names and keep the
+    prop outcome visible. Matchup / category goes in the smaller description.
+    """
+    short_a = short_fighter_name(fighter_a)
+    short_b = short_fighter_name(fighter_b)
+    matchup = f"{short_a} vs {short_b}"
+
+    label = shorten_names_in_text(description or "", fighter_a, fighter_b)
+    label = _abbreviate_prop_phrases(label)
+
+    # Drop redundant "A vs B " prefix from the label when the prop still remains.
+    vs_re = re.compile(
+        rf"^{re.escape(short_a)}\s+vs\s+{re.escape(short_b)}\s+",
+        re.I,
+    )
+    m = vs_re.match(label)
+    if m:
+        prop = label[m.end() :].strip(" ·–—-")
+        if prop:
+            label = prop
+
+    opt_desc = f"{matchup} · {category_label}" if category_label else matchup
+
+    label = label.strip() or description or "Play"
+    if len(label) > 100:
+        # Keep both fighter cue and trailing prop (where Discord usually cuts).
+        label = f"{label[:48]}…{label[-49:]}"
+    label = label[:100]
+
+    if opt_desc:
+        opt_desc = opt_desc[:100]
+    return label, opt_desc or None
+
+
 def _is_under_side(label: str) -> bool:
     return bool(re.search(r"\bunder\b", label, re.I))
 
@@ -104,9 +191,11 @@ def _fighter_side_fallback(play: Any, fighter_a: str, fighter_b: str) -> str:
 def _is_fighter_specific(outcome_type: str) -> bool:
     if outcome_type in _FIGHTER_SPECIFIC_DIRECT:
         return True
-    if re.match(r"^(KO|SUB)_\d$", outcome_type):  # method+round, e.g. KO_2
+    if re.match(r"^(KO|SUB)_\d(_\d)?$", outcome_type):  # KO_2 or KO_1_2
         return True
-    if re.match(r"^R_\d$", outcome_type):  # round-win, e.g. R_3
+    if re.match(r"^R_\d(_\d)?$", outcome_type):  # R_3 or R_1_2
+        return True
+    if re.match(r"^R_\d+(?:_\d+)*_DEC$", outcome_type):  # R_4_5_DEC
         return True
     return False
 
@@ -214,8 +303,19 @@ def rebuild_description_from_stored(
         if m := re.match(r"^(KO|SUB)_(\d)$", outcome_type):
             method_text = "KO/TKO" if m.group(1) == "KO" else "Submission"
             return f"{fighter_pick} by {method_text} (Round {m.group(2)})"
+        if m := re.match(r"^(KO|SUB)_(\d)_(\d)$", outcome_type):
+            method_text = "KO/TKO" if m.group(1) == "KO" else "Submission"
+            return (
+                f"{fighter_pick} by {method_text} in Rounds "
+                f"{m.group(2)} or {m.group(3)}"
+            )
         if m := re.match(r"^R_(\d)$", outcome_type):
             return f"{fighter_pick} wins in Round {m.group(1)}"
+        if m := re.match(r"^R_(\d)_(\d)$", outcome_type):
+            return f"{fighter_pick} wins in Round {m.group(1)} or {m.group(2)}"
+        if m := re.match(r"^R_(\d+(?:_\d+)*)_DEC$", outcome_type):
+            label = ", ".join(m.group(1).split("_"))
+            return f"{fighter_pick} Round {label} or by Decision"
         return current_description  # unrecognized -- leave it alone
 
     fight_label = f"{fighter_a} vs {fighter_b}"
@@ -246,8 +346,16 @@ def _build_description(
         if m := re.match(r"^(KO|SUB)_(\d)$", outcome_type):
             method_text = "KO/TKO" if m.group(1) == "KO" else "Submission"
             return f"{fighter_pick} by {method_text} (Round {m.group(2)})"
+        if m := re.match(r"^(KO|SUB)_(\d)_(\d)$", outcome_type):
+            method_text = "KO/TKO" if m.group(1) == "KO" else "Submission"
+            return (
+                f"{fighter_pick} by {method_text} in Rounds "
+                f"{m.group(2)} or {m.group(3)}"
+            )
         if m := re.match(r"^R_(\d)$", outcome_type):
             return f"{fighter_pick} wins in Round {m.group(1)}"
+        if m := re.match(r"^R_(\d)_(\d)$", outcome_type):
+            return f"{fighter_pick} wins in Round {m.group(1)} or {m.group(2)}"
         # Unrecognized fighter-specific type -- fall back to the raw label,
         # prefixed with the fighter's name if it isn't already there.
         if label and fighter_pick.lower() in label.lower():
@@ -264,5 +372,15 @@ def _build_description(
         return f"{fight_label} ends in round {m.group(1)}"
     if m := re.match(r"^START_(\d)$", outcome_type):
         return f"{fight_label} reaches round {m.group(1)}"
-    # Unrecognized fight-level type -- fall back to fight_label + raw label.
-    return f"{fight_label} {label}" if label else f"{fight_label} ({outcome_type})"
+    # Unrecognized type -- if the raw label already names a fighter, keep it
+    # as fighter-centric text (don't double up with a full "A vs B" prefix).
+    if label:
+        named = _match_fighter(label, fighter_a, fighter_b) or (
+            fighter_pick if fighter_pick and fighter_pick.lower() in label.lower() else None
+        )
+        if named:
+            return label
+        if fight_label.lower() in label.lower():
+            return label
+        return f"{fight_label} · {label}"
+    return f"{fight_label} ({outcome_type})"

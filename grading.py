@@ -23,7 +23,10 @@ from typing import Any, Optional
 
 _TOTAL_ROUNDS_RE = re.compile(r"^(OVER|UNDER)_(\d)_5$")
 _ROUND_WIN_RE = re.compile(r"^R_(\d)$")
+_ROUND_WIN_COMBO_RE = re.compile(r"^R_(\d)_(\d)$")
+_ROUND_OR_DEC_RE = re.compile(r"^R_(\d+(?:_\d+)*)_DEC$")
 _METHOD_ROUND_RE = re.compile(r"^(KO|SUB)_(\d)$")
+_METHOD_ROUND_COMBO_RE = re.compile(r"^(KO|SUB)_(\d)_(\d)$")
 _END_ROUND_RE = re.compile(r"^END_(\d)$")
 _START_ROUND_RE = re.compile(r"^START_(\d)$")
 
@@ -260,6 +263,18 @@ def grade_bet(bet: dict[str, Any], result: dict[str, Any]) -> Optional[tuple[str
             return None
         return ("won" if method in ("KO_TKO", "SUB") else "loss", True)
 
+    if m := _ROUND_OR_DEC_RE.match(outcome_type):
+        # Alt round betting: win in rounds N/M/... OR by decision
+        want = {int(x) for x in m.group(1).split("_")}
+        if method is None and round_num is None and end_round is None:
+            return None
+        if method == "DEC":
+            return ("won", True)
+        if round_num is None and end_round is None:
+            return None
+        actual = int(round_num if round_num is not None else end_round)
+        return ("won" if actual in want else "loss", True)
+
     if m := _ROUND_WIN_RE.match(outcome_type):
         want = int(m.group(1))
         if round_num is None and end_round is None:
@@ -270,6 +285,15 @@ def grade_bet(bet: dict[str, Any], result: dict[str, Any]) -> Optional[tuple[str
             # not "wins on scorecards after N rounds".
             return ("loss", True)
         return ("won" if actual == want else "loss", True)
+
+    if m := _ROUND_WIN_COMBO_RE.match(outcome_type):
+        want = {int(m.group(1)), int(m.group(2))}
+        if round_num is None and end_round is None:
+            return None
+        actual = int(round_num if round_num is not None else end_round)
+        if method == "DEC":
+            return ("loss", True)
+        return ("won" if actual in want else "loss", True)
 
     if m := _METHOD_ROUND_RE.match(outcome_type):
         need_raw, want = m.group(1).upper(), int(m.group(2))
@@ -282,6 +306,19 @@ def grade_bet(bet: dict[str, Any], result: dict[str, Any]) -> Optional[tuple[str
             return None
         actual = int(round_num if round_num is not None else end_round)
         return ("won" if actual == want else "loss", True)
+
+    if m := _METHOD_ROUND_COMBO_RE.match(outcome_type):
+        need_raw = m.group(1).upper()
+        want = {int(m.group(2)), int(m.group(3))}
+        need = "KO_TKO" if need_raw == "KO" else need_raw
+        if method is None:
+            return None
+        if method != need:
+            return ("loss", True)
+        if round_num is None and end_round is None:
+            return None
+        actual = int(round_num if round_num is not None else end_round)
+        return ("won" if actual in want else "loss", True)
 
     # Classic method props (and optional outcome_round from older builder)
     if outcome_type in ("KO_TKO", "SUB", "DEC"):

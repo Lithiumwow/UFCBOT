@@ -108,6 +108,22 @@ def build_fallback_catalog(
     for n in range(1, 6):
         _add(f"END_{n}", f"Fight Ends in Round {n}", side=1, category="method_fight")
 
+    # Method + round (common book “KO in R1/R2” style markets)
+    for corner, name in ((1, fighter_a), (2, fighter_b)):
+        for n in range(1, 4):
+            _add(
+                f"KO_{n}",
+                f"{name} — Wins by KO/TKO in round {n}",
+                side=corner,
+                category="round_method",
+            )
+            _add(
+                f"SUB_{n}",
+                f"{name} — Wins by submission in round {n}",
+                side=corner,
+                category="round_method",
+            )
+
     return PropCatalog(
         fight_slug=fight_slug or "fallback",
         fight_label=f"{fighter_a} vs {fighter_b}",

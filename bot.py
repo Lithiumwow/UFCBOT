@@ -8,6 +8,7 @@ from discord.ext import commands, tasks
 
 import config
 import espn
+from branding import sync_bot_avatar
 from database import Database
 from props_loader import ensure_fightiq_path
 from views import BetView
@@ -255,6 +256,7 @@ def main():
             bot.intents.message_content,
             ", ".join(sorted(c.name for c in bot.commands)) or "(none)",
         )
+        await sync_bot_avatar(bot)
 
     bot.run(config.DISCORD_TOKEN)
 

@@ -54,8 +54,15 @@ _OUTCOME_KEYWORDS = [
     ("ko/sub", "KO_OR_SUB"),
     ("ko/tko or submission", "KO_OR_SUB"),
     ("ko/tko or sub", "KO_OR_SUB"),
+    # FanDuel Method of Victory Double Chance
+    ("ko, tko, dq or submission", "KO_OR_SUB"),
+    ("ko/tko/dq or submission", "KO_OR_SUB"),
+    ("ko tko dq or submission", "KO_OR_SUB"),
+    ("by ko, tko, dq or submission", "KO_OR_SUB"),
+    ("by ko/tko/dq or submission", "KO_OR_SUB"),
     ("moneyline", "ML"),
     ("money line", "ML"),
+    ("to win fight", "ML"),
     ("to win", "ML"),
     ("ko/tko", "KO_TKO"),
     ("knockout", "KO_TKO"),
@@ -170,8 +177,8 @@ def _strip_outcome_noise(text: str) -> str:
     cleaned = _FIGHT_KO_RE.sub(" ", cleaned)
     cleaned = re.sub(
         r"\b("
-        r"by|via|to\s+win|ml|moneyline|money\s*line|"
-        r"ko/?tko|ko/?sub|knockout|tko|ko|"
+        r"by|via|to\s+win(?:\s+fight)?|ml|moneyline|money\s*line|"
+        r"ko/?tko|ko/?sub|knockout|tko|ko|dq|"
         r"sub(?:mission)?|decision|dec|pts|points|"
         r"round|rounds?|rd\.?|r\d|"
         r"over|under|distance|either\s+fighter|"

@@ -15,7 +15,7 @@ import discord
 
 from card_data import fight_corners, fight_slug
 from leg_parser import parse_leg_line
-from prop_play_map import map_play_to_leg
+from prop_play_map import map_play_to_leg, select_option_texts
 from props_loader import try_load_prop_catalog
 
 log = logging.getLogger("ufc-bet-bot.bet_builder")
@@ -172,18 +172,22 @@ class PropPlaySelect(discord.ui.Select):
         self.state = state
         options = []
         for play in state.page_slice()[:PAGE_SIZE]:
-            # Preview exactly what the leg will read as once picked (e.g.
-            # "Islam Makhachev ML"), rather than the raw FightOdds label --
-            # the dropdown itself should already read clearly, not just
-            # the description stored after selection.
+            # Discord select labels are capped at 100 chars and do not wrap —
+            # use last names + abbreviated props so the outcome stays visible.
             preview = map_play_to_leg(play, fighter_a=state.fighter_a, fighter_b=state.fighter_b)
-            label = preview.get("description") or play.label or play.offer_type_id or "Play"
+            full = preview.get("description") or play.label or play.offer_type_id or "Play"
             category_text = CATEGORY_LABELS.get(play.category, play.category or "")
+            label, opt_desc = select_option_texts(
+                full,
+                fighter_a=state.fighter_a,
+                fighter_b=state.fighter_b,
+                category_label=category_text,
+            )
             options.append(
                 discord.SelectOption(
-                    label=label[:100],
+                    label=label,
                     value=play.id[:100],
-                    description=category_text[:100] or None,
+                    description=opt_desc,
                 )
             )
         if not options:

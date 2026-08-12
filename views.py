@@ -958,3 +958,57 @@ class EditBetModal(discord.ui.Modal):
             embed=embed,
             ephemeral=True,
         )
+
+
+class ConfirmSlipImportView(discord.ui.View):
+    """Confirm OCR-parsed slip before logging via BetsCog._log_bet."""
+
+    def __init__(
+        self,
+        *,
+        cog,
+        invoker_id: int,
+        event: str | None,
+        legs: list[dict],
+        units: float,
+        odds: int | None,
+        ocr_preview: str = "",
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.invoker_id = invoker_id
+        self.event = event
+        self.legs = legs
+        self.units = units
+        self.odds = odds
+        self.ocr_preview = ocr_preview
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "This isn't your slip import.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm & Log", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✅ Logging slip…", view=None)
+        await self.cog._log_bet(
+            interaction,
+            sport="ufc",
+            event=self.event,
+            legs=self.legs,
+            units=self.units,
+            odds=self.odds,
+            use_followup=True,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Cancelled — slip not logged.", view=None
+        )
+        self.stop()
+

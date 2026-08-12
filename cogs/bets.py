@@ -12,10 +12,12 @@ import card_data
 from bet_builder import BetBuilderSession, BuilderView
 from betting_math import CURRENCY_SYMBOLS, get_user_settings
 from embeds import build_bet_embed, build_results_embed
-from views import BetView, CardShareView, ConfirmDeleteEventView
+from views import BetView, CardShareView, ConfirmDeleteEventView, ConfirmSlipImportView
 from checks import is_admin, resolve_allowed_target, target_user_id_from_namespace
 from spreadsheet_image import build_event_recap_image
 from leg_rematch import rematch_bets_to_card
+from slip_ocr import image_to_slip, text_to_slip
+from slip_match import match_legs_to_card
 
 
 class BetsCog(commands.Cog):
@@ -436,6 +438,133 @@ class BetsCog(commands.Cog):
             legs=legs,
             units=units,
             odds=odds,
+        )
+
+    # ---------- slip screenshot import ----------
+
+    @app_commands.command(
+        name="bet-slip",
+        description="Import a bookmaker slip from a screenshot and/or pasted text",
+    )
+    @is_admin()
+    @app_commands.describe(
+        image="Screenshot of your bet slip (optional if you paste text)",
+        text="Paste slip text if OCR isn't available / accurate",
+        event="UFC / DWCS event to attach (autocompletes from upcoming)",
+        units="Stake in units (default 1.0)",
+    )
+    @app_commands.autocomplete(event=ufc_event_autocomplete)
+    async def bet_slip(
+        self,
+        interaction: discord.Interaction,
+        image: discord.Attachment | None = None,
+        text: str | None = None,
+        event: str | None = None,
+        units: app_commands.Range[float, 0.01, 1000.0] | None = 1.0,
+    ):
+        if image is None and not (text and text.strip()):
+            await interaction.response.send_message(
+                "⚠️ Attach a slip **image** and/or paste slip **text**.",
+                ephemeral=True,
+            )
+            return
+        if image is not None:
+            if not image.content_type or not image.content_type.startswith("image/"):
+                await interaction.response.send_message(
+                    "⚠️ `image` must be an image file.", ephemeral=True
+                )
+                return
+            if image.size and image.size > 8_000_000:
+                await interaction.response.send_message(
+                    "⚠️ Image is too large (max ~8MB).", ephemeral=True
+                )
+                return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if image is not None:
+                raw = await image.read()
+                parsed = await image_to_slip(raw, filename=image.filename or "slip.png")
+            else:
+                parsed = text_to_slip(text or "")
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Couldn't read that slip: `{e}`\n\n"
+                "Tip: paste the slip into the `text` option, or try a clearer crop.",
+                ephemeral=True,
+            )
+            return
+
+        legs = parsed.get("legs") or []
+        if not legs:
+            preview = (parsed.get("ocr_text") or text or "")[:800]
+            await interaction.followup.send(
+                "⚠️ No legs were detected.\n"
+                f"```\n{preview or '(empty)'}\n```\n"
+                "Try pasting clearer text in `text`, or use `/bet-ufc`.",
+                ephemeral=True,
+            )
+            return
+
+        if event:
+            upcoming = self._upcoming_events()
+            matched = card_data.match_event_in_list(event, upcoming) if upcoming else None
+            if matched is not None:
+                event = matched.get("short_name") or matched.get("name") or event
+        else:
+            upcoming = self._upcoming_events()
+            if upcoming:
+                event = upcoming[0].get("short_name") or upcoming[0].get("name")
+
+        match_notes: list[str] = []
+        try:
+            legs, match_notes = await match_legs_to_card(legs, event=event)
+        except Exception as e:
+            match_notes = [f"Catalog match skipped: {e}"]
+
+        odds = parsed.get("odds")
+        dec = parsed.get("decimal_odds")
+        lines = []
+        for i, leg in enumerate(legs, start=1):
+            mark = " ✓" if leg.get("matched") else ""
+            ot = leg.get("match_offer_type") or leg.get("outcome_type") or ""
+            ot_bit = f"  · `{ot}`" if ot else ""
+            lines.append(f"**{i}.** {leg['description']}{mark}{ot_bit}")
+        lines_txt = "\n".join(lines)
+        odds_note = (
+            f"**{odds:+d}**" if isinstance(odds, int) else "_(none detected — edit after logging)_"
+        )
+        if dec:
+            odds_note += f"  ·  decimal `{dec:g}`"
+
+        note_txt = ""
+        if match_notes:
+            short = [
+                n
+                for n in match_notes
+                if n.startswith("Catalog-matched") or "Matched →" in n
+            ]
+            if short:
+                note_txt = "\n" + "\n".join(f"- _{n}_" for n in short[:8])
+
+        await interaction.followup.send(
+            content=(
+                f"📷 **Parsed slip** ({len(legs)} leg(s))"
+                + (f" · event **{event}**" if event else " · _no event set_")
+                + f"\nOdds {odds_note} · units **{units:g}**\n\n{lines_txt}"
+                + note_txt
+                + "\n\n✓ = structured / catalog-matched. Confirm to log, or cancel."
+            ),
+            view=ConfirmSlipImportView(
+                cog=self,
+                invoker_id=interaction.user.id,
+                event=event,
+                legs=legs,
+                units=float(units or 1.0),
+                odds=odds if isinstance(odds, int) else None,
+                ocr_preview=(parsed.get("ocr_text") or "")[:500],
+            ),
+            ephemeral=True,
         )
 
     # ---------- settings ----------
