@@ -40,7 +40,11 @@ INTENTS.message_content = True
 
 class UFCBetBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=INTENTS)
+        super().__init__(
+            command_prefix="!",
+            intents=INTENTS,
+            case_insensitive=True,
+        )
         self.db = Database(config.DB_PATH)
         self.cached_events: list[dict] = []       # UFC only -- NBA games aren't tracked
 
@@ -141,20 +145,42 @@ class UFCBetBot(commands.Bot):
         # button on the bet card itself, not through this reply flow.)
         if message.reference and self.user in message.mentions:
             if message.author.id not in config.ALLOWED_USER_IDS:
-                return  # bot is locked to specific users; silently ignore anyone else
-
-            if "delete" not in message.content.lower():
+                await self.process_commands(message)
                 return
 
-            bet, target = await self._resolve_reply_target(message)
-            if bet is None:
+            if "delete" in message.content.lower():
+                bet, target = await self._resolve_reply_target(message)
+                if bet is not None and target is not None:
+                    await self._handle_delete(message, bet, target)
                 return
 
-            await self._handle_delete(message, bet, target)
-
-        # No prefix commands are registered anymore, but this stays as a
-        # harmless no-op hook in case one gets added later.
+        # Always dispatch prefix commands (!restart, etc.)
         await self.process_commands(message)
+
+    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        """Prefix commands fail silently by default — always reply so !restart isn't mute."""
+        err = getattr(error, "original", error)
+
+        if isinstance(error, commands.CheckFailure):
+            await ctx.reply(
+                "🚫 You're not authorized to use this command.",
+                mention_author=False,
+            )
+            return
+
+        if isinstance(error, commands.CommandNotFound):
+            # Ignore unknown !commands — don't spam the channel
+            return
+
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.reply(f"⚠️ Missing argument: `{error.param.name}`", mention_author=False)
+            return
+
+        log.exception("Prefix command error in %s", ctx.command, exc_info=error)
+        try:
+            await ctx.reply(f"❌ Command error: `{err}`", mention_author=False)
+        except discord.HTTPException:
+            pass
 
     async def _resolve_reply_target(
         self, message: discord.Message
@@ -223,6 +249,11 @@ def main():
     @bot.event
     async def on_ready():
         log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
+        log.info(
+            "Intents: message_content=%s | prefix commands: %s",
+            bot.intents.message_content,
+            ", ".join(sorted(c.name for c in bot.commands)) or "(none)",
+        )
 
     bot.run(config.DISCORD_TOKEN)
 

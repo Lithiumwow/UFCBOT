@@ -28,10 +28,15 @@ PANEL_SERVER_ID = os.getenv("PANEL_SERVER_ID", "").strip()
 # Only these Discord user IDs are allowed to use the bot's commands/buttons.
 # Each person's bets are fully isolated by their own user ID -- nobody sees
 # or can touch anyone else's bets, even though they share one bot/database.
+# Extra IDs can be added via ALLOWED_USER_IDS in .env (comma-separated).
+_allowed_raw = os.getenv("ALLOWED_USER_IDS", "").strip()
+_allowed_from_env = {
+    int(x.strip()) for x in _allowed_raw.split(",") if x.strip().isdigit()
+}
 ALLOWED_USER_IDS = {
     1085484343050371092,
     458418768679272458,
-}
+} | _allowed_from_env
 
 # All auto-grading debug messages (per-leg settle notices, etc.) go to this
 # one fixed channel, regardless of which channel the underlying bet was
