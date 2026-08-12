@@ -87,6 +87,7 @@ class PLCog(commands.Cog):
                 unit_value=unit_value,
                 currency=currency,
                 icon_url=owner.display_avatar.url,
+                event=event,
             )
             chart_title = f"Units — {event}{whose}"
             share_event = event

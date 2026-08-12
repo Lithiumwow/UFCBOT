@@ -21,6 +21,8 @@ from betting_math import (
     format_odds,
     format_native_with_usd,
 )
+from branding import apply_event_logo, brand_color, brand_label, event_brand
+
 
 STATUS_COLOR = {
     "pending": discord.Color.gold(),
@@ -148,7 +150,7 @@ def build_bet_embed(
     embed = discord.Embed(
         title=f"{STATUS_EMOJI.get(status, '🥊')}  {title_text}",
         description=f"🗓️ **{bet.get('event') or 'Event TBD'}**",
-        color=STATUS_COLOR.get(status, discord.Color.blurple()),
+        color=STATUS_COLOR.get(status, brand_color(bet.get("event"))),
     )
 
     if user is not None and co_user is not None:
@@ -156,13 +158,18 @@ def build_bet_embed(
             name=f"{user.display_name} + {co_user.display_name} · Collab Slip",
             icon_url=user.display_avatar.url,
         )
-        embed.set_thumbnail(url=user.display_avatar.url)
     elif user is not None:
         embed.set_author(
             name=f"{user.display_name} · Bet Slip",
             icon_url=user.display_avatar.url,
         )
-        embed.set_thumbnail(url=user.display_avatar.url)
+
+    # Event brand logo (UFC / DWCS) — not the user avatar
+    apply_event_logo(embed, bet.get("event"))
+    embed.set_footer(
+        text=f"{brand_label(bet.get('event'))}  ·  Bet #{bet['id']}"
+        + (f"  •  Logged {(bet.get('created_at') or '')[:10]}" if bet.get("created_at") else "")
+    )
 
     if is_parlay:
         legs_value = "\n".join(f"**{i}.** {leg}" for i, leg in enumerate(legs, start=1))
@@ -193,8 +200,6 @@ def build_bet_embed(
             inline=False,
         )
 
-    created = (bet.get("created_at") or "")[:10]
-    embed.set_footer(text=f"Bet #{bet['id']}" + (f"  •  Logged {created}" if created else ""))
     return embed
 
 
@@ -301,6 +306,7 @@ def build_results_embed(
     include_weekly: bool = False,
     include_monthly: bool = False,
     include_biggest_wins: bool = False,
+    event: Optional[str] = None,
 ) -> discord.Embed:
     won = [b for b in bets if b["status"] == "won"]
     loss = [b for b in bets if b["status"] == "loss"]
@@ -313,7 +319,12 @@ def build_results_embed(
     decided = len(won) + len(loss)
     win_rate = (len(won) / decided * 100) if decided else 0.0
 
-    color = discord.Color(0x87CEFA)  # light blue
+    # Prefer explicit event; else infer from title / first bet
+    brand_event = event or title
+    if not event and bets:
+        brand_event = bets[0].get("event") or title
+
+    color = brand_color(brand_event)
 
     trend = "📈" if net_native > 0 else "📉" if net_native < 0 else "📊"
 
@@ -321,8 +332,9 @@ def build_results_embed(
         title=f"{trend}  {title}",
         color=color,
     )
+    apply_event_logo(embed, brand_event)
     if icon_url:
-        embed.set_thumbnail(url=icon_url)
+        embed.set_author(name=brand_label(brand_event), icon_url=icon_url)
 
     # Compact summary block instead of four separate small fields -- easier
     # to scan at a glance.
@@ -409,6 +421,7 @@ def build_pl_embed(
     currency: str,
     icon_url: Optional[str] = None,
     include_event_breakdown: bool = False,
+    event: Optional[str] = None,
 ) -> discord.Embed:
     """Focused P/L summary -- record, staked, net, ROI. Optional per-event
     lines when viewing overall."""
@@ -424,6 +437,14 @@ def build_pl_embed(
     win_rate = (len(won) / decided * 100) if decided else 0.0
     roi = (net_native / settled_staked) if settled_staked else 0.0
 
+    brand_event = event
+    if not brand_event and bets and not include_event_breakdown:
+        brand_event = bets[0].get("event")
+    # Overall P/L defaults to UFC branding unless every bet is DWCS
+    if not brand_event and bets:
+        brands = {event_brand(b.get("event")) for b in bets}
+        brand_event = "DWCS" if brands == {"dwcs"} else "UFC"
+
     if net_native > 0:
         color = discord.Color.brand_green()
         trend = "📈"
@@ -431,12 +452,13 @@ def build_pl_embed(
         color = discord.Color.brand_red()
         trend = "📉"
     else:
-        color = discord.Color.light_grey()
+        color = brand_color(brand_event)
         trend = "📊"
 
     embed = discord.Embed(title=f"{trend}  {title}", color=color)
+    apply_event_logo(embed, brand_event)
     if icon_url:
-        embed.set_thumbnail(url=icon_url)
+        embed.set_author(name=brand_label(brand_event), icon_url=icon_url)
 
     embed.description = "\n".join(
         [

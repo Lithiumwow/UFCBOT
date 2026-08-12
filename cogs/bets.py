@@ -279,6 +279,7 @@ class BetsCog(commands.Cog):
             currency=currency,
             icon_url=owner.display_avatar.url,
             include_bet_list=True,
+            event=event,
         )
         await interaction.response.send_message(
             embed=embed,
