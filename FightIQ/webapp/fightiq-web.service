@@ -1,0 +1,15 @@
+[Unit]
+Description=FightIQ odds sandbox web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.local/FightIQ
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /root/.local/FightIQ/webapp/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

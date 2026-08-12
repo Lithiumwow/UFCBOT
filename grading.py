@@ -22,6 +22,10 @@ import re
 from typing import Any, Optional
 
 _TOTAL_ROUNDS_RE = re.compile(r"^(OVER|UNDER)_(\d)_5$")
+_ROUND_WIN_RE = re.compile(r"^R_(\d)$")
+_METHOD_ROUND_RE = re.compile(r"^(KO|SUB)_(\d)$")
+_END_ROUND_RE = re.compile(r"^END_(\d)$")
+_START_ROUND_RE = re.compile(r"^START_(\d)$")
 
 
 def _name_matches(pick: str, espn_name: str) -> bool:
@@ -167,6 +171,9 @@ def grade_bet(bet: dict[str, Any], result: dict[str, Any]) -> Optional[tuple[str
 
     outcome_type = (bet.get("outcome_type") or "ML").upper()
     method = result.get("method")
+    round_num = result.get("round")
+    picked_round = bet.get("outcome_round")
+    end_round = _actual_end_round(result)
 
     total_rounds_match = _TOTAL_ROUNDS_RE.match(outcome_type)
     if total_rounds_match:
@@ -174,8 +181,8 @@ def grade_bet(bet: dict[str, Any], result: dict[str, Any]) -> Optional[tuple[str
         line = whole + 0.5
         return _grade_total_rounds(direction, line, result)
 
+    # ---- Winner-agnostic fight props ----
     if outcome_type in ("DISTANCE", "NOT_DISTANCE", "FIGHT_KO", "FIGHT_SUB"):
-        # Winner-agnostic: if method can't be determined, leave pending.
         if method is None:
             return None
         went_the_distance = method == "DEC"
@@ -187,6 +194,36 @@ def grade_bet(bet: dict[str, Any], result: dict[str, Any]) -> Optional[tuple[str
             return ("won" if method == "KO_TKO" else "loss", True)
         return ("won" if method == "SUB" else "loss", True)  # FIGHT_SUB
 
+    if m := _END_ROUND_RE.match(outcome_type):
+        want = int(m.group(1))
+        if end_round is None and round_num is None:
+            return None
+        actual = int(round_num if round_num is not None else end_round)
+        # Decision lasting full fight: END_N only wins if N is the scheduled length
+        # and they went the distance? Sportsbooks usually price "fight ends in round N"
+        # as a finish in that round — decisions don't hit END_N.
+        if method == "DEC":
+            return ("loss", True)
+        return ("won" if actual == want else "loss", True)
+
+    if m := _START_ROUND_RE.match(outcome_type):
+        want = int(m.group(1))
+        # Fight reached round N if it ended in N or later (or went to decision).
+        if method == "DEC":
+            scheduled = result.get("scheduled_rounds")
+            if scheduled is None:
+                return ("won", True)  # decision ⇒ all early rounds started
+            return ("won" if int(scheduled) >= want else "loss", True)
+        if end_round is None and round_num is None:
+            return None
+        actual = int(round_num if round_num is not None else end_round)
+        return ("won" if actual >= want else "loss", True)
+
+    if outcome_type == "DRAW":
+        # ESPN UFC rarely posts draws; leave pending unless we somehow know.
+        return None
+
+    # ---- Fighter-scoped props ----
     picked = bet.get("fighter_pick") or ""
     winner = result.get("winner")
 
@@ -196,28 +233,71 @@ def grade_bet(bet: dict[str, Any], result: dict[str, Any]) -> Optional[tuple[str
     if outcome_type == "ML":
         return ("won", True)
 
-    round_num = result.get("round")
-    picked_round = bet.get("outcome_round")
+    if outcome_type == "ID":
+        # Inside the distance = finish (not decision)
+        if method is None:
+            return None
+        return ("won" if method in ("KO_TKO", "SUB") else "loss", True)
 
-    # Method / round props must be verified — never "winner-only" WON.
-    if method is None:
-        return None
+    if outcome_type in ("UD", "SD"):
+        # ESPN usually only reports DEC — grade as decision win/loss.
+        if method is None:
+            return None
+        return ("won" if method == "DEC" else "loss", True)
+
+    if outcome_type == "KO_DEC":
+        if method is None:
+            return None
+        return ("won" if method in ("KO_TKO", "DEC") else "loss", True)
+
+    if outcome_type == "SUB_DEC":
+        if method is None:
+            return None
+        return ("won" if method in ("SUB", "DEC") else "loss", True)
 
     if outcome_type == "KO_OR_SUB":
-        method_matches = method in ("KO_TKO", "SUB")
-    else:
-        method_matches = method == outcome_type
+        if method is None:
+            return None
+        return ("won" if method in ("KO_TKO", "SUB") else "loss", True)
 
-    if not method_matches:
-        return ("loss", True)
-
-    if picked_round is not None:
-        if round_num is None:
-            return None  # need end-round before settling a specific-round prop
-        if int(picked_round) != int(round_num):
+    if m := _ROUND_WIN_RE.match(outcome_type):
+        want = int(m.group(1))
+        if round_num is None and end_round is None:
+            return None
+        actual = int(round_num if round_num is not None else end_round)
+        if method == "DEC":
+            # Round-winner props usually mean "wins the fight in round N" (finish),
+            # not "wins on scorecards after N rounds".
             return ("loss", True)
+        return ("won" if actual == want else "loss", True)
 
-    return ("won", True)
+    if m := _METHOD_ROUND_RE.match(outcome_type):
+        need_raw, want = m.group(1).upper(), int(m.group(2))
+        need = "KO_TKO" if need_raw == "KO" else need_raw
+        if method is None:
+            return None
+        if method != need:
+            return ("loss", True)
+        if round_num is None and end_round is None:
+            return None
+        actual = int(round_num if round_num is not None else end_round)
+        return ("won" if actual == want else "loss", True)
+
+    # Classic method props (and optional outcome_round from older builder)
+    if outcome_type in ("KO_TKO", "SUB", "DEC"):
+        if method is None:
+            return None
+        if method != outcome_type:
+            return ("loss", True)
+        if picked_round is not None:
+            if round_num is None:
+                return None
+            if int(picked_round) != int(round_num):
+                return ("loss", True)
+        return ("won", True)
+
+    # Unknown exotic offer types — leave pending for manual grade
+    return None
 
 
 def aggregate_bet_status(leg_statuses: list[str]) -> Optional[str]:

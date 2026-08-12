@@ -1,0 +1,2 @@
+# FightIQ uses Python 3.10+ standard library only.
+# Optional: add httpx / aiohttp later for async Discord bots.

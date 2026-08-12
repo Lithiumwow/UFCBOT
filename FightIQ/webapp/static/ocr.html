@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FightIQ — OCR slips</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg"></div>
+  <header class="top">
+    <div class="brand">
+      <a class="mark" href="/">FightIQ</a>
+      <span class="sub">OCR · slip images</span>
+    </div>
+    <nav class="top-nav">
+      <a href="/" class="nav-link">Odds</a>
+      <a href="/ocr" class="nav-link active">OCR slips</a>
+    </nav>
+    <div class="status ok">Image OCR workspace</div>
+  </header>
+
+  <main class="ocr-page">
+    <section class="panel ocr-panel">
+      <h2>Slip image OCR</h2>
+      <p class="hint">
+        Separate window for bet-slip screenshots. Upload/OCR + QuickPick wiring lands here later —
+        keeps the main odds feed free of heavy image code.
+      </p>
+      <div class="ocr-drop" id="ocrDrop" aria-disabled="true">
+        <div class="ocr-drop-label">Image drop / camera upload — coming soon</div>
+        <div class="muted">Until then, paste OCR text below and parse.</div>
+      </div>
+      <textarea id="slipText" rows="8" placeholder="Paste slip text (or future OCR output)…&#10;e.g.&#10;Carol Foro ML -150&#10;Juliana Miller by submission +200"></textarea>
+      <div class="search-row slip-actions">
+        <label class="chk"><input type="checkbox" id="useQuickpick" checked /> QuickPick</label>
+        <button id="parseSlipBtn">Parse + save</button>
+        <button id="gradeOpenBtn" class="ghost">Grade open slips</button>
+      </div>
+      <pre id="slipParseOut" class="slip-out muted">Ready when you are.</pre>
+      <div class="panel-head" style="margin-top:1rem">
+        <h3 class="subh">Saved slips</h3>
+        <button class="ghost" id="reloadSlips">Refresh</button>
+      </div>
+      <div id="slipList" class="slip-list"></div>
+      <p class="muted" id="slipStatusMeta">—</p>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="/static/ocr.js"></script>
+</body>
+</html>

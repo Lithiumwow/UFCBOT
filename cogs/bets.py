@@ -127,7 +127,8 @@ class BetsCog(commands.Cog):
     async def bet_ufc(self, interaction: discord.Interaction, event: str | None = None):
         # Card fetch (FightOdds/ESPN) often exceeds Discord's 3s reply window —
         # Contender Series and cold caches were silently timing out as "Unknown interaction".
-        await interaction.response.defer()
+        # Ephemeral so fight/outcome selects stay private to the invoker.
+        await interaction.response.defer(ephemeral=True)
 
         matched = None
         # Hard-block past/finished cards even if the user pastes a free-text name
@@ -157,7 +158,7 @@ class BetsCog(commands.Cog):
                 # Canonical upcoming label (FightOdds / ESPN short_name)
                 event = matched.get("short_name") or matched.get("name") or event
 
-        fights: list[tuple[str, str]] = []
+        fights: list = []
         event_pk = None
         if event:
             # Prefer FightOdds pk from the upcoming cache when available
@@ -187,10 +188,16 @@ class BetsCog(commands.Cog):
                 "**Free-Text Leg** or try again in a moment."
             )
         elif event and fights:
-            note = f"\n\n_Loaded **{len(fights)}** fights from the card._"
+            with_slug = sum(1 for f in fights if len(f) > 2 and f[2])
+            note = (
+                f"\n\n_Loaded **{len(fights)}** fights"
+                f" ({with_slug} with live FightOdds props)._"
+            )
 
         message = await interaction.followup.send(
-            content=session.summary_text() + note, view=BuilderView(session)
+            content=session.summary_text() + note,
+            view=BuilderView(session),
+            ephemeral=True,
         )
         session.message = message
 

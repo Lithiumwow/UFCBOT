@@ -33,10 +33,20 @@ _PROP_OUTCOMES = frozenset(
         "FIGHT_SUB",
         "DISTANCE",
         "NOT_DISTANCE",
+        "ID",
+        "UD",
+        "SD",
+        "KO_DEC",
+        "SUB_DEC",
+        "DRAW",
     }
 )
 
 _TOTAL_ROUNDS_RE = re.compile(r"^(OVER|UNDER)_\d_5$")
+_FIGHTIQ_PROP_RE = re.compile(
+    r"^(R_\d|KO_\d|SUB_\d|END_\d|START_\d|OVERUNDER_)",
+    re.IGNORECASE,
+)
 
 # Anything with method / round / totals / fight-ending detail → prop
 _PROP_HINT = re.compile(
@@ -133,7 +143,9 @@ def categorize_legs(legs: list[dict[str, Any]]) -> str:
         if _looks_like_prop(desc):
             return "Prop"
         return "Straight Pick"
-    if outcome in _PROP_OUTCOMES or _TOTAL_ROUNDS_RE.match(outcome or ""):
+    if outcome in _PROP_OUTCOMES or _TOTAL_ROUNDS_RE.match(outcome or "") or _FIGHTIQ_PROP_RE.match(
+        outcome or ""
+    ):
         return "Prop"
     if outcome:
         # Any other coded market (including with outcome_round set) → prop

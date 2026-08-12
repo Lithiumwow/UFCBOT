@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FightIQ — odds sandbox</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
+</head>
+<body>
+  <div class="bg"></div>
+  <!-- Cloudflare Turnstile for QuickPick website create (same sitekey as quickpick.pikkit.com) -->
+  <div id="cf-turnstile" class="cf-turnstile-host" aria-hidden="true"></div>
+  <header class="top">
+    <div class="brand">
+      <a class="mark" href="/">FightIQ</a>
+      <span class="sub">Bet sandbox · full props · FightOdds.io</span>
+    </div>
+    <nav class="top-nav">
+      <a href="/" class="nav-link active">Odds</a>
+      <a href="/ocr" class="nav-link" target="_blank" rel="noopener">OCR slips</a>
+    </nav>
+    <div class="status" id="status">Loading…</div>
+  </header>
+
+  <main class="layout">
+    <section class="panel modes">
+      <h2>1 · Bet type</h2>
+      <div class="mode-row" role="tablist">
+        <button class="mode" data-mode="straight">Straight</button>
+        <button class="mode" data-mode="prop">Prop</button>
+        <button class="mode active" data-mode="parlay">Parlay / multi</button>
+      </div>
+      <p class="hint" id="modeHint">Click plays to stack a ticket. Multiple picks combine odds automatically.</p>
+    </section>
+
+    <section class="panel bookie">
+      <div class="panel-head">
+        <h2>Bookie</h2>
+        <button class="ghost" id="clearBook">Any / best</button>
+      </div>
+      <select id="bookSelect">
+        <option value="">All books (best price)</option>
+      </select>
+      <p class="hint">Filter lines to FanDuel, DraftKings, BetMGM, etc. Leave empty for best available.</p>
+    </section>
+
+    <section class="panel events">
+      <div class="panel-head">
+        <h2>2 · Event</h2>
+        <button class="ghost" id="reloadEvents">Refresh</button>
+      </div>
+      <div class="search-row">
+        <input id="eventSearch" type="search" placeholder="Search event e.g. UFC 330" />
+        <button id="loadCardBtn">Load card</button>
+      </div>
+      <div id="eventList" class="list"></div>
+    </section>
+
+    <section class="panel card">
+      <div class="panel-head">
+        <h2>3 · Fight card</h2>
+        <span class="muted" id="cardMeta">Pick an event</span>
+      </div>
+      <div id="fightList" class="fight-list"></div>
+    </section>
+
+    <section class="panel board">
+      <div class="panel-head">
+        <h2>4 · Plays</h2>
+        <span class="muted" id="boardMeta">Select a fight</span>
+      </div>
+      <div class="play-toolbar" id="playToolbar" hidden>
+        <div class="search-row">
+          <input id="playSearch" type="search" placeholder="Search: over 2.5, submission, round 1, distance…" />
+          <button id="searchPlaysBtn">Search</button>
+        </div>
+        <div class="chip-row" id="viewChips">
+          <button class="chip active" data-view="popular">Popular</button>
+          <button class="chip" data-view="all">All</button>
+        </div>
+        <div class="chip-row" id="catChips"></div>
+        <div class="muted" id="playCount"></div>
+      </div>
+      <div id="board" class="plays-list empty">Click a fight to load markets from the books.</div>
+    </section>
+
+    <aside class="panel ticket">
+      <div class="panel-head">
+        <h2>Ticket</h2>
+        <button class="ghost danger" id="clearTicket">Clear</button>
+      </div>
+      <div id="ticketLegs" class="ticket-legs empty">No legs yet. Click plays to build a slip.</div>
+      <div class="ticket-total" id="ticketTotal">
+        <div class="total-label" id="combinedLabel">Combined</div>
+        <div class="total-price" id="combinedPrice">—</div>
+        <div class="total-sub" id="combinedSub"></div>
+      </div>
+      <div class="ticket-actions">
+        <button class="primary" id="copyTicket" disabled>Copy summary</button>
+        <div class="betslip-compose">
+          <div class="betslip-label">Generate betslip</div>
+          <textarea id="betslipMsg" rows="3" placeholder="Your ticket text will appear here — edit if needed, then send." disabled></textarea>
+          <div class="betslip-row">
+            <button class="ghost gen-bs" id="genQuickpick" disabled title="Send to QuickPick API">
+              QuickPick
+            </button>
+            <button class="ghost gen-bs" id="genGambly" disabled title="Send to Gambly API">
+              Gambly
+            </button>
+            <button class="ghost gen-bs" id="genPlaybook" disabled title="Send to Playbook (if available)">
+              Playbook
+            </button>
+          </div>
+        </div>
+      </div>
+      <div id="betslipOut" class="betslip-out muted" hidden></div>
+      <pre class="ticket-raw" id="ticketRaw" hidden></pre>
+    </aside>
+  </main>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

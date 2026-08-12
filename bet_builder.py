@@ -1,143 +1,86 @@
 """
-Interactive, click-only bet builder for /bet-ufc. Discord modals can only
-contain plain text boxes (no dropdowns), so this instead walks through
-real Select menus (dropdowns), populated with the actual card, so nothing
-has to be typed for a structured leg:
+Interactive bet builder for /bet-ufc.
 
-    Pick a FIGHT (dropdown, e.g. "Islam Makhachev vs Ian Machado Garry")
-        -> pick who wins + how, OR a fight-level (either-fighter) outcome
-            -> pick round if relevant -> leg added
-
-The outcome dropdown, scoped to one fight, has two kinds of entries:
-  - per-fighter picks, e.g. "Islam Makhachev - Submission",
-    "Ian Machado Garry - KO/TKO or Submission"
-  - fight-level picks that don't name a specific fighter, e.g.
-    "Fight Ends by KO/TKO (Either Fighter)", "Fight Goes the Distance"
-
-A "📝 Free-Text Leg" button covers anything that doesn't fit that shape
-(props, totals, etc) via a single-field modal -- typing is still available
-there for whoever wants it, including the "Fighter - Outcome" shorthand if
-you'd rather type one leg than click through it.
+After picking a fight, props come from FightIQ's live FightOdds catalog
+(labels only — no odds). Browse Popular / category / search, pick a play,
+and the leg is added. Free-text remains as a fallback.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+from typing import Any, Optional
+
 import discord
 
-from leg_parser import describe_outcome, parse_leg_line
+from card_data import fight_corners, fight_slug
+from leg_parser import parse_leg_line
+from prop_play_map import map_play_to_leg
+from props_loader import try_load_prop_catalog
+
+log = logging.getLogger("ufc-bet-bot.bet_builder")
 
 MAX_LEGS = 6
+PAGE_SIZE = 25
 
-# Per-fighter picks -- who wins, and how.
-PER_FIGHTER_OPTIONS = [
-    ("Moneyline (just the winner)", "ML"),
-    ("KO/TKO", "KO_TKO"),
-    ("Submission", "SUB"),
-    ("Decision", "DEC"),
-    ("KO/TKO or Submission", "KO_OR_SUB"),
-]
-
-# Fight-level picks -- about how the fight ends, regardless of who wins.
-FIGHT_LEVEL_OPTIONS = [
-    ("Fight Ends by KO/TKO (Either Fighter)", "FIGHT_KO"),
-    ("Fight Ends by Submission (Either Fighter)", "FIGHT_SUB"),
-    ("Fight Goes the Distance (Decision)", "DISTANCE"),
-    ("Fight Does NOT Go the Distance (KO/TKO or Sub)", "NOT_DISTANCE"),
-]
-
-# Total-rounds Over/Under -- also fight-level/winner-agnostic.
-# "Under 0.5 Rounds" = fight ends before 2:30 of round 1.
-# "Over 2.5 Rounds" = fight lasts past 2:30 of round 3 (i.e. into R3 second half+).
-# A decision counts as lasting the full scheduled length (3 or 5 rounds).
-TOTAL_ROUNDS_OPTIONS = [
-    ("Over 0.5 Rounds", "OVER_0_5"),
-    ("Over 1.5 Rounds", "OVER_1_5"),
-    ("Over 2.5 Rounds", "OVER_2_5"),
-    ("Over 3.5 Rounds", "OVER_3_5"),
-    ("Over 4.5 Rounds", "OVER_4_5"),
-    ("Under 0.5 Rounds", "UNDER_0_5"),
-    ("Under 1.5 Rounds", "UNDER_1_5"),
-    ("Under 2.5 Rounds", "UNDER_2_5"),
-    ("Under 3.5 Rounds", "UNDER_3_5"),
-    ("Under 4.5 Rounds", "UNDER_4_5"),
-]
-
-ROUND_NEEDED_OUTCOMES = {"KO_TKO", "SUB", "KO_OR_SUB", "FIGHT_KO", "FIGHT_SUB"}
-
-# Kept short for the actual bet label/description -- the dropdown option
-# text above is more verbose ("(Either Fighter)" etc) to make the pick
-# clear while *choosing*, but that clarifier doesn't need to live in the
-# logged bet's description too.
-_FIGHT_LEVEL_LABELS = {
-    "FIGHT_KO": "ends by KO/TKO",
-    "FIGHT_SUB": "ends by Submission",
-    "DISTANCE": "goes the distance",
-    "NOT_DISTANCE": "does NOT go the distance",
+CATEGORY_LABELS = {
+    "moneyline": "Moneyline",
+    "totals": "Totals O/U",
+    "distance": "Distance / start",
+    "method_fight": "Fight method",
+    "method_fighter": "Fighter method",
+    "round_fighter": "Round winner",
+    "round_method": "Round + method",
+    "other": "Other",
 }
 
-
-def _fight_level_description(fighter_a: str, fighter_b: str, outcome_type: str, round_num: int | None) -> str:
-    total_rounds_label = {value: label for label, value in TOTAL_ROUNDS_OPTIONS}.get(outcome_type)
-    if total_rounds_label:
-        # e.g. "Islam Makhachev vs Ian Machado Garry - Over 2.5 Rounds"
-        return f"{fighter_a} vs {fighter_b} - {total_rounds_label}"
-
-    desc = f"{fighter_a} vs {fighter_b} {_FIGHT_LEVEL_LABELS[outcome_type]}"
-    if round_num and outcome_type in ("FIGHT_KO", "FIGHT_SUB"):
-        desc += f" (Round {round_num})"
-    return desc
+CATEGORY_ORDER = [
+    "moneyline",
+    "totals",
+    "distance",
+    "method_fight",
+    "method_fighter",
+    "round_fighter",
+    "round_method",
+    "other",
+]
 
 
 class BetBuilderSession:
-    """Shared state for one /bet-ufc builder run, referenced by every
-    dropdown/button/modal involved."""
+    """Shared state for one /bet-ufc builder run."""
 
     def __init__(
-        self, *, event: str | None, fights: list[tuple[str, str]], invoker_id: int, cog,
+        self,
+        *,
+        event: str | None,
+        fights: list,
+        invoker_id: int,
+        cog,
     ):
         self.event = event
-        self.fights = fights  # list of (fighter_a, fighter_b)
+        # list of (fighter_a, fighter_b, slug|None)
+        self.fights = fights
         self.invoker_id = invoker_id
         self.cog = cog
         self.legs: list[dict] = []
         self.message: discord.Message | None = None
-        # Pending leg-in-progress state, set once a fight+outcome is picked
-        # and cleared once the round step (if any) finalizes it.
-        self._pending_fighter: str | None = None  # anchor for matching, always set
-        self._pending_outcome: str | None = None
-        self._pending_is_fight_level: bool = False
-        self._pending_fighter_a: str | None = None
-        self._pending_fighter_b: str | None = None
 
     def summary_text(self) -> str:
         header = f"🥊 **Building bet for {self.event or '(no event set)'}**"
         if not self.legs:
-            return f"{header}\n\nNo legs added yet. Pick a fight below, or add a free-text leg."
-        lines = "\n".join(f"{i}. {leg['description']}" for i, leg in enumerate(self.legs, start=1))
-        remaining = MAX_LEGS - len(self.legs)
-        footer = f"\n\n{remaining} more leg(s) can be added." if remaining > 0 else "\n\nMax legs reached."
-        return f"{header}\n\n{lines}{footer}"
-
-    def finalize_pending_leg(self, round_val: int | None) -> None:
-        if self._pending_is_fight_level:
-            description = _fight_level_description(
-                self._pending_fighter_a, self._pending_fighter_b, self._pending_outcome, round_val
+            return (
+                f"{header}\n\nNo legs added yet. Pick a fight below, or add a free-text leg."
             )
-        else:
-            description = describe_outcome(self._pending_fighter, self._pending_outcome, round_val)
-
-        self.legs.append(
-            {
-                "description": description,
-                "fighter_pick": self._pending_fighter,
-                "outcome_type": self._pending_outcome,
-                "outcome_round": round_val,
-            }
+        lines = "\n".join(
+            f"{i}. {leg['description']}" for i, leg in enumerate(self.legs, start=1)
         )
-        self._pending_fighter = None
-        self._pending_outcome = None
-        self._pending_is_fight_level = False
-        self._pending_fighter_a = None
-        self._pending_fighter_b = None
+        remaining = MAX_LEGS - len(self.legs)
+        footer = (
+            f"\n\n{remaining} more leg(s) can be added."
+            if remaining > 0
+            else "\n\nMax legs reached."
+        )
+        return f"{header}\n\n{lines}{footer}"
 
     async def refresh_message(self) -> None:
         if self.message is None:
@@ -152,147 +95,358 @@ def _check_invoker(interaction: discord.Interaction, session: BetBuilderSession)
     return interaction.user.id == session.invoker_id
 
 
-class RoundSelect(discord.ui.Select):
-    def __init__(self, session: BetBuilderSession):
-        self.session = session
-        options = [discord.SelectOption(label=f"Round {n}", value=str(n)) for n in range(1, 6)]
-        options.append(discord.SelectOption(label="Not specified", value="none"))
-        super().__init__(placeholder="Which round? (optional)", options=options)
+class PropBrowseState:
+    """In-progress prop browsing for one fight."""
 
-    async def callback(self, interaction: discord.Interaction):
-        if not _check_invoker(interaction, self.session):
-            await interaction.response.send_message("🚫 Not your bet builder.", ephemeral=True)
-            return
-        round_val = None if self.values[0] == "none" else int(self.values[0])
-        self.session.finalize_pending_leg(round_val)
-        await interaction.response.defer()
-        await self.session.refresh_message()
-
-
-class RoundSelectView(discord.ui.View):
-    def __init__(self, session: BetBuilderSession):
-        super().__init__(timeout=300)
-        self.add_item(RoundSelect(session))
-
-
-class FightOutcomeSelect(discord.ui.Select):
-    """Scoped to ONE fight -- lists both fighters crossed with every
-    per-fighter outcome, plus the fight-level (either-fighter) outcomes,
-    all in one dropdown. Total-rounds Over/Under is a separate dropdown
-    (see TotalRoundsSelect) shown alongside this one, since combining
-    everything into a single 24-option list would be unwieldy."""
-
-    def __init__(self, session: BetBuilderSession, fighter_a: str, fighter_b: str):
+    def __init__(
+        self,
+        session: BetBuilderSession,
+        *,
+        fighter_a: str,
+        fighter_b: str,
+        slug: Optional[str],
+        catalog: Any,
+    ):
         self.session = session
         self.fighter_a = fighter_a
         self.fighter_b = fighter_b
+        self.slug = slug
+        self.catalog = catalog
+        self.mode: str = "popular"  # popular | category | search
+        self.category: Optional[str] = None
+        self.query: Optional[str] = None
+        self.page: int = 0
+        self.plays: list = []
+        self._refresh_plays()
 
-        options = []
-        for fighter in (fighter_a, fighter_b):
-            for label, value in PER_FIGHTER_OPTIONS:
-                option_label = f"{fighter} - {label}"
-                options.append(
-                    discord.SelectOption(label=option_label[:100], value=f"F|{fighter}|{value}"[:100])
-                )
-        for label, value in FIGHT_LEVEL_OPTIONS:
-            options.append(discord.SelectOption(label=label[:100], value=f"M|{value}"[:100]))
-
-        super().__init__(placeholder="Who wins, and how?", options=options[:25], row=0)
-
-    async def callback(self, interaction: discord.Interaction):
-        if not _check_invoker(interaction, self.session):
-            await interaction.response.send_message("🚫 Not your bet builder.", ephemeral=True)
+    def _refresh_plays(self) -> None:
+        if self.catalog is None:
+            self.plays = []
             return
-
-        kind, *rest = self.values[0].split("|")
-
-        if kind == "F":
-            fighter, outcome = rest
-            self.session._pending_fighter = fighter
-            self.session._pending_outcome = outcome
-            self.session._pending_is_fight_level = False
-            prompt_subject = fighter
-        else:  # "M" -- fight-level
-            (outcome,) = rest
-            self.session._pending_fighter = self.fighter_a  # anchor for matching only
-            self.session._pending_outcome = outcome
-            self.session._pending_is_fight_level = True
-            self.session._pending_fighter_a = self.fighter_a
-            self.session._pending_fighter_b = self.fighter_b
-            prompt_subject = f"{self.fighter_a} vs {self.fighter_b}"
-
-        if outcome in ROUND_NEEDED_OUTCOMES:
-            await interaction.response.edit_message(
-                content=f"**{prompt_subject}** — {outcome.replace('_', '/')}. Which round?",
-                view=RoundSelectView(self.session),
-            )
+        if self.mode == "search" and self.query:
+            self.plays = self.catalog.filter(query=self.query, limit=None)
+        elif self.mode == "category" and self.category:
+            self.plays = self.catalog.filter(category=self.category, limit=None)
         else:
-            self.session.finalize_pending_leg(None)
-            await interaction.response.defer()
-            await self.session.refresh_message()
+            self.plays = self.catalog.filter(popular_only=True, limit=None)
+            if not self.plays:
+                self.plays = self.catalog.filter(limit=None)
+
+    def page_slice(self) -> list:
+        start = self.page * PAGE_SIZE
+        return self.plays[start : start + PAGE_SIZE]
+
+    def total_pages(self) -> int:
+        if not self.plays:
+            return 1
+        return max(1, (len(self.plays) + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    def heading(self) -> str:
+        fight = f"**{self.fighter_a} vs {self.fighter_b}**"
+        if self.mode == "search" and self.query:
+            scope = f'Search: "{self.query}"'
+        elif self.mode == "category" and self.category:
+            scope = CATEGORY_LABELS.get(self.category, self.category)
+        else:
+            scope = "Popular props"
+        page = self.page + 1
+        pages = self.total_pages()
+        n = len(self.plays)
+        return (
+            f"{fight} — {scope}\n"
+            f"_Page {page}/{pages} · {n} play(s). Odds not shown — pick a market._"
+        )
 
 
-class TotalRoundsSelect(discord.ui.Select):
-    """Separate dropdown for Over/Under total rounds -- also fight-level
-    and winner-agnostic, kept apart from FightOutcomeSelect so neither
-    dropdown gets overloaded with options."""
-
-    def __init__(self, session: BetBuilderSession, fighter_a: str, fighter_b: str):
-        self.session = session
-        self.fighter_a = fighter_a
-        self.fighter_b = fighter_b
-        options = [
-            discord.SelectOption(label=label[:100], value=value[:100])
-            for label, value in TOTAL_ROUNDS_OPTIONS
-        ]
-        super().__init__(placeholder="...or total rounds Over/Under", options=options, row=1)
+class PropPlaySelect(discord.ui.Select):
+    def __init__(self, state: PropBrowseState):
+        self.state = state
+        options = []
+        for play in state.page_slice()[:PAGE_SIZE]:
+            options.append(
+                discord.SelectOption(
+                    label=(play.label or play.offer_type_id or "Play")[:100],
+                    value=play.id[:100],
+                    description=(play.offer_type_id or play.category or "")[:100] or None,
+                )
+            )
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="No props on this page",
+                    value="__empty__",
+                )
+            ]
+        super().__init__(
+            placeholder="Pick a prop / method / round…",
+            options=options,
+            row=0,
+        )
 
     async def callback(self, interaction: discord.Interaction):
-        if not _check_invoker(interaction, self.session):
-            await interaction.response.send_message("🚫 Not your bet builder.", ephemeral=True)
+        session = self.state.session
+        if not _check_invoker(interaction, session):
+            await interaction.response.send_message(
+                "🚫 Not your bet builder.", ephemeral=True
+            )
+            return
+        if self.values[0] == "__empty__":
+            await interaction.response.defer()
+            return
+        if len(session.legs) >= MAX_LEGS:
+            await interaction.response.send_message(
+                "⚠️ Max legs reached.", ephemeral=True
+            )
             return
 
-        outcome = self.values[0]
-        self.session._pending_fighter = self.fighter_a  # anchor for matching only
-        self.session._pending_outcome = outcome
-        self.session._pending_is_fight_level = True
-        self.session._pending_fighter_a = self.fighter_a
-        self.session._pending_fighter_b = self.fighter_b
-        self.session.finalize_pending_leg(None)  # the O/U line IS the pick, no round sub-step
+        play = self.state.catalog.get(self.values[0]) if self.state.catalog else None
+        if play is None:
+            # Fallback: match from current page list
+            play = next(
+                (p for p in self.state.plays if p.id == self.values[0]), None
+            )
+        if play is None:
+            await interaction.response.send_message(
+                "⚠️ That prop is no longer available. Try again.", ephemeral=True
+            )
+            return
+
+        leg = map_play_to_leg(
+            play,
+            fighter_a=self.state.fighter_a,
+            fighter_b=self.state.fighter_b,
+        )
+        session.legs.append(leg)
         await interaction.response.defer()
-        await self.session.refresh_message()
+        await session.refresh_message()
 
 
-class FightOutcomeView(discord.ui.View):
-    def __init__(self, session: BetBuilderSession, fighter_a: str, fighter_b: str):
+class PropCategorySelect(discord.ui.Select):
+    def __init__(self, state: PropBrowseState):
+        self.state = state
+        cats: set[str] = set()
+        if state.catalog is not None:
+            for p in state.catalog.plays:
+                if p.category:
+                    cats.add(p.category)
+        ordered = [c for c in CATEGORY_ORDER if c in cats] or list(cats)
+        options = [
+            discord.SelectOption(
+                label=CATEGORY_LABELS.get(c, c)[:100],
+                value=c[:100],
+            )
+            for c in ordered[:25]
+        ]
+        if not options:
+            options = [discord.SelectOption(label="No categories", value="__none__")]
+        super().__init__(
+            placeholder="Or browse by category…",
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not _check_invoker(interaction, self.state.session):
+            await interaction.response.send_message(
+                "🚫 Not your bet builder.", ephemeral=True
+            )
+            return
+        if self.values[0] == "__none__":
+            await interaction.response.defer()
+            return
+        self.state.mode = "category"
+        self.state.category = self.values[0]
+        self.state.query = None
+        self.state.page = 0
+        self.state._refresh_plays()
+        await interaction.response.edit_message(
+            content=self.state.heading(),
+            view=PropBrowseView(self.state),
+        )
+
+
+class PropSearchModal(discord.ui.Modal, title="Search props"):
+    def __init__(self, state: PropBrowseState):
+        super().__init__()
+        self.state = state
+        self.query_input = discord.ui.TextInput(
+            label="Search",
+            placeholder="e.g. submission, round 2, over 2.5",
+            max_length=80,
+            required=True,
+        )
+        self.add_item(self.query_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.state.mode = "search"
+        self.state.query = self.query_input.value.strip()
+        self.state.category = None
+        self.state.page = 0
+        self.state._refresh_plays()
+        await interaction.response.edit_message(
+            content=self.state.heading(),
+            view=PropBrowseView(self.state),
+        )
+
+
+class PropBrowseView(discord.ui.View):
+    def __init__(self, state: PropBrowseState):
         super().__init__(timeout=300)
-        self.add_item(FightOutcomeSelect(session, fighter_a, fighter_b))
-        self.add_item(TotalRoundsSelect(session, fighter_a, fighter_b))
+        self.state = state
+        self.add_item(PropPlaySelect(state))
+        self.add_item(PropCategorySelect(state))
+
+        popular_btn = discord.ui.Button(
+            label="⭐ Popular", style=discord.ButtonStyle.primary, row=2
+        )
+        popular_btn.callback = self._popular
+        self.add_item(popular_btn)
+
+        search_btn = discord.ui.Button(
+            label="🔎 Search", style=discord.ButtonStyle.secondary, row=2
+        )
+        search_btn.callback = self._search
+        self.add_item(search_btn)
+
+        if state.page > 0:
+            prev_btn = discord.ui.Button(
+                label="◀ Prev", style=discord.ButtonStyle.secondary, row=3
+            )
+            prev_btn.callback = self._prev
+            self.add_item(prev_btn)
+
+        if state.page + 1 < state.total_pages():
+            next_btn = discord.ui.Button(
+                label="Next ▶", style=discord.ButtonStyle.secondary, row=3
+            )
+            next_btn.callback = self._next
+            self.add_item(next_btn)
+
+        back_btn = discord.ui.Button(
+            label="↩ Back to fights", style=discord.ButtonStyle.danger, row=3
+        )
+        back_btn.callback = self._back
+        self.add_item(back_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return _check_invoker(interaction, self.state.session)
+
+    async def _popular(self, interaction: discord.Interaction):
+        self.state.mode = "popular"
+        self.state.category = None
+        self.state.query = None
+        self.state.page = 0
+        self.state._refresh_plays()
+        await interaction.response.edit_message(
+            content=self.state.heading(),
+            view=PropBrowseView(self.state),
+        )
+
+    async def _search(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(PropSearchModal(self.state))
+
+    async def _prev(self, interaction: discord.Interaction):
+        self.state.page = max(0, self.state.page - 1)
+        await interaction.response.edit_message(
+            content=self.state.heading(),
+            view=PropBrowseView(self.state),
+        )
+
+    async def _next(self, interaction: discord.Interaction):
+        self.state.page = min(self.state.total_pages() - 1, self.state.page + 1)
+        await interaction.response.edit_message(
+            content=self.state.heading(),
+            view=PropBrowseView(self.state),
+        )
+
+    async def _back(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content=self.state.session.summary_text(),
+            view=BuilderView(self.state.session),
+        )
 
 
 class FightSelect(discord.ui.Select):
     def __init__(self, session: BetBuilderSession):
         self.session = session
-        options = [
-            discord.SelectOption(label=f"{a} vs {b}"[:100], value=str(idx))
-            for idx, (a, b) in enumerate(session.fights[:25])
-        ]
+        options = []
+        for idx, fight in enumerate(session.fights[:25]):
+            a, b = fight_corners(fight)
+            options.append(
+                discord.SelectOption(label=f"{a} vs {b}"[:100], value=str(idx))
+            )
         super().__init__(placeholder="Pick a fight...", options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
         if not _check_invoker(interaction, self.session):
-            await interaction.response.send_message("🚫 Not your bet builder.", ephemeral=True)
+            await interaction.response.send_message(
+                "🚫 Not your bet builder.", ephemeral=True
+            )
             return
-        fighter_a, fighter_b = self.session.fights[int(self.values[0])]
-        await interaction.response.edit_message(
-            content=f"**{fighter_a} vs {fighter_b}** — who wins, and how?",
-            view=FightOutcomeView(self.session, fighter_a, fighter_b),
+        fight = self.session.fights[int(self.values[0])]
+        fighter_a, fighter_b = fight_corners(fight)
+        slug = fight_slug(fight)
+
+        await interaction.response.defer()
+
+        catalog = None
+        if slug:
+            catalog = await asyncio.to_thread(
+                try_load_prop_catalog,
+                slug,
+                fighter_a=fighter_a,
+                fighter_b=fighter_b,
+            )
+        elif fighter_a and fighter_b:
+            catalog = await asyncio.to_thread(
+                try_load_prop_catalog,
+                None,
+                fighter_a=fighter_a,
+                fighter_b=fighter_b,
+            )
+
+        if catalog is None or not getattr(catalog, "plays", None):
+            note = (
+                f"**{fighter_a} vs {fighter_b}**\n\n"
+                "⚠️ Couldn't load props for this fight. "
+                "Use **Free-Text Leg** from the main builder, or pick another fight."
+            )
+            try:
+                await interaction.edit_original_response(
+                    content=note + "\n\n" + self.session.summary_text(),
+                    view=BuilderView(self.session),
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        state = PropBrowseState(
+            self.session,
+            fighter_a=fighter_a,
+            fighter_b=fighter_b,
+            slug=slug,
+            catalog=catalog,
         )
+        if getattr(catalog, "event_name", "") == "__fightiq_fallback__":
+            heading = (
+                f"**{fighter_a} vs {fighter_b}** — Method / round markets\n"
+                f"_FightOdds props not posted yet — showing FightIQ method catalog "
+                f"(no odds). Page 1/{state.total_pages()} · {len(state.plays)} play(s)._"
+            )
+        else:
+            heading = state.heading()
+
+        try:
+            await interaction.edit_original_response(
+                content=heading,
+                view=PropBrowseView(state),
+            )
+        except discord.HTTPException:
+            pass
 
 
 class FreeTextLegModal(discord.ui.Modal, title="Add a Free-Text Leg"):
-    """For anything the dropdowns can't express -- props, totals, etc.
-    Still understands the 'Fighter - Outcome' shorthand if typed here."""
+    """For anything the catalog can't express — still parses Fighter - Outcome."""
 
     def __init__(self, session: BetBuilderSession):
         super().__init__()
@@ -313,9 +467,7 @@ class FreeTextLegModal(discord.ui.Modal, title="Add a Free-Text Leg"):
 
 
 class FinishBetModal(discord.ui.Modal, title="Finish Bet"):
-    """Last step -- units and odds, right before the bet actually gets
-    logged. Kept separate from the fight-picking flow since these are
-    plain numbers, not something there's a sensible dropdown for."""
+    """Last step — units and odds before the bet is logged."""
 
     def __init__(self, session: BetBuilderSession):
         super().__init__()
@@ -345,7 +497,8 @@ class FinishBetModal(discord.ui.Modal, title="Finish Bet"):
                 odds = int(odds_raw)
             except ValueError:
                 await interaction.response.send_message(
-                    "⚠️ Odds must be a whole number, e.g. `-150` or `120`.", ephemeral=True
+                    "⚠️ Odds must be a whole number, e.g. `-150` or `120`.",
+                    ephemeral=True,
                 )
                 return
 
@@ -385,7 +538,9 @@ class BuilderView(discord.ui.View):
             finish_btn.callback = self._finish_callback
             self.add_item(finish_btn)
 
-        cancel_btn = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=1)
+        cancel_btn = discord.ui.Button(
+            label="❌ Cancel", style=discord.ButtonStyle.danger, row=1
+        )
         cancel_btn.callback = self._cancel_callback
         self.add_item(cancel_btn)
 
@@ -394,7 +549,9 @@ class BuilderView(discord.ui.View):
 
     async def _freetext_callback(self, interaction: discord.Interaction):
         if len(self.session.legs) >= MAX_LEGS:
-            await interaction.response.send_message("⚠️ Max legs reached.", ephemeral=True)
+            await interaction.response.send_message(
+                "⚠️ Max legs reached.", ephemeral=True
+            )
             return
         await interaction.response.send_modal(FreeTextLegModal(self.session))
 
@@ -402,6 +559,10 @@ class BuilderView(discord.ui.View):
         await interaction.response.send_modal(FinishBetModal(self.session))
 
     async def _cancel_callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            pass
         try:
             await self.session.message.delete()
         except discord.HTTPException:

@@ -50,7 +50,8 @@ COL_LETTERS = {name: get_column_letter(i + 1) for i, name in enumerate(COLUMNS)}
 def _find_opponent(fighter: Optional[str], fights: list[tuple[str, str]]) -> str:
     if not fighter:
         return ""
-    for a, b in fights:
+    for fight in fights:
+        a, b = fight[0], fight[1]
         if _name_matches(fighter, a):
             return b
         if _name_matches(fighter, b):

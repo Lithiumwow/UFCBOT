@@ -9,7 +9,11 @@ from discord.ext import commands, tasks
 import config
 import espn
 from database import Database
+from props_loader import ensure_fightiq_path
 from views import BetView
+
+# FightIQ package lives under ./FightIQ/fightiq
+ensure_fightiq_path()
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ufc-bet-bot")

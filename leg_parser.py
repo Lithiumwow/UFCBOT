@@ -26,6 +26,11 @@ _OUTCOME_LABELS = {
     "FIGHT_SUB": "ends by Submission",
     "DISTANCE": "goes the distance",
     "NOT_DISTANCE": "does NOT go the distance",
+    "ID": "wins inside the distance",
+    "UD": "by Unanimous Decision",
+    "SD": "by Split Decision",
+    "KO_DEC": "by KO/TKO or Decision",
+    "SUB_DEC": "by Submission or Decision",
 }
 
 # Longest/most-specific phrases first

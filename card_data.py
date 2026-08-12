@@ -20,9 +20,22 @@ import espn
 
 log = logging.getLogger("ufc-bet-bot.card_data")
 
+# Fight card entry: (fighter_a, fighter_b, fightodds_slug|None)
+FightCardEntry = tuple[str, str, Optional[str]]
+
 # In-memory card cache: event_key -> (fetched_at, fights)
-_fight_cache: dict[str, tuple[float, list[tuple[str, str]]]] = {}
+_fight_cache: dict[str, tuple[float, list[FightCardEntry]]] = {}
 _CACHE_TTL_SEC = 30 * 60
+
+
+def fight_corners(fight: tuple) -> tuple[str, str]:
+    """Return (fighter_a, fighter_b) from a 2- or 3-tuple card entry."""
+    return fight[0], fight[1]
+
+
+def fight_slug(fight: tuple) -> Optional[str]:
+    """FightOdds slug when present (3rd element)."""
+    return fight[2] if len(fight) > 2 else None
 
 
 def _fold(text: str) -> str:
@@ -115,16 +128,21 @@ def _best_event_name(query: str, candidates: list[str], min_score: float = 25.0)
     return best_name if best >= min_score else None
 
 
-def _fights_from_nodes(fights: list) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
+def _fights_from_nodes(fights: list) -> list[FightCardEntry]:
+    out: list[FightCardEntry] = []
     for f in fights:
         if getattr(f, "is_cancelled", False):
             continue
         a = (f.fighter1_name or "").strip()
         b = (f.fighter2_name or "").strip()
+        slug = (getattr(f, "slug", None) or "").strip() or None
         if a and b:
-            out.append((a, b))
+            out.append((a, b, slug))
     return out
+
+
+def _with_null_slugs(fights: list[tuple[str, str]]) -> list[FightCardEntry]:
+    return [(a, b, None) for a, b in fights]
 
 
 def _is_contender_query(name: str) -> bool:
@@ -132,7 +150,7 @@ def _is_contender_query(name: str) -> bool:
     return "contender" in n or "dwcs" in n
 
 
-def _fightodds_fights_by_pk_sync(pk: int) -> list[tuple[str, str]]:
+def _fightodds_fights_by_pk_sync(pk: int) -> list[FightCardEntry]:
     try:
         from client import FightOddsClient
     except Exception:
@@ -147,7 +165,7 @@ def _fightodds_fights_by_pk_sync(pk: int) -> list[tuple[str, str]]:
     return _fights_from_nodes(fights)
 
 
-def _fightodds_fights_sync(event_name: str) -> list[tuple[str, str]]:
+def _fightodds_fights_sync(event_name: str) -> list[FightCardEntry]:
     try:
         from client import FightOddsClient
     except Exception:
@@ -261,7 +279,7 @@ def _fightodds_fights_sync(event_name: str) -> list[tuple[str, str]]:
     return _fights_from_nodes(fights)
 
 
-async def _espn_fights_fuzzy(event_name: str) -> list[tuple[str, str]]:
+async def _espn_fights_fuzzy(event_name: str) -> list[FightCardEntry]:
     """ESPN scoreboard — past + future window, fuzzy event name match."""
     today = datetime.date.today()
     start = today - datetime.timedelta(days=90)
@@ -279,7 +297,7 @@ async def _espn_fights_fuzzy(event_name: str) -> list[tuple[str, str]]:
                 data = await resp.json()
     except Exception:
         try:
-            return await espn.fetch_fights_for_event(event_name)
+            return _with_null_slugs(await espn.fetch_fights_for_event(event_name))
         except Exception:
             return []
 
@@ -294,7 +312,7 @@ async def _espn_fights_fuzzy(event_name: str) -> list[tuple[str, str]]:
         return []
 
     matching = next(ev for n, ev in candidates if n == match_name)
-    fights: list[tuple[str, str]] = []
+    fights: list[FightCardEntry] = []
     for comp in matching.get("competitions", []):
         competitors = comp.get("competitors", [])
         if len(competitors) != 2:
@@ -305,7 +323,7 @@ async def _espn_fights_fuzzy(event_name: str) -> list[tuple[str, str]]:
         # skip TBA placeholders
         if "tba" in name_a.lower() or "tba" in name_b.lower():
             continue
-        fights.append((name_a, name_b))
+        fights.append((name_a, name_b, None))
     fights.reverse()
     return fights
 
@@ -315,8 +333,8 @@ async def fetch_fights_for_event(
     *,
     use_cache: bool = True,
     event_pk: int | str | None = None,
-) -> list[tuple[str, str]]:
-    """Return [(fighter_a, fighter_b), ...] for an event name (fuzzy-friendly).
+) -> list[FightCardEntry]:
+    """Return [(fighter_a, fighter_b, fightodds_slug|None), ...] for an event.
 
     Prefer `event_pk` (FightOdds id) when known from the upcoming-events cache —
     that avoids name ambiguity (Contender Week 1 vs Week 10, Bellator, etc.).
@@ -331,7 +349,7 @@ async def fetch_fights_for_event(
         if now - ts < _CACHE_TTL_SEC and cached:
             return list(cached)
 
-    fights: list[tuple[str, str]] = []
+    fights: list[FightCardEntry] = []
     if event_pk is not None and str(event_pk).isdigit():
         try:
             fights = await asyncio.to_thread(_fightodds_fights_by_pk_sync, int(event_pk))
@@ -508,7 +526,7 @@ async def fetch_upcoming_events(limit: int = 12) -> list[dict[str, Any]]:
 
 
 def match_fighter_on_card(
-    name: str, fights: list[tuple[str, str]]
+    name: str, fights: list
 ) -> Optional[tuple[str, str, str]]:
     """If `name` matches a corner on the card, return (fighter, opponent, fight_label)."""
     if not name or not fights:
@@ -517,7 +535,8 @@ def match_fighter_on_card(
     q_tokens = [t for t in re.split(r"[^a-z0-9]+", q) if t]
     best = None
     best_score = 0
-    for a, b in fights:
+    for fight in fights:
+        a, b = fight_corners(fight)
         for me, them in ((a, b), (b, a)):
             ml = me.lower()
             m_tokens = [t for t in re.split(r"[^a-z0-9]+", ml) if t]
@@ -543,7 +562,7 @@ def resolve_fighter_on_card(
     *,
     fighter_pick: Optional[str],
     description: Optional[str],
-    fights: list[tuple[str, str]],
+    fights: list,
 ) -> Optional[tuple[str, str, str]]:
     """
     Canonical card match for a leg: prefer fighter_pick if it lands on the card,
@@ -561,13 +580,14 @@ def resolve_fighter_on_card(
     return None
 
 
-def infer_fighter_from_text(text: str, fights: list[tuple[str, str]]) -> Optional[str]:
+def infer_fighter_from_text(text: str, fights: list) -> Optional[str]:
     """Pull a card fighter name mentioned in free-text pick text."""
     if not text or not fights:
         return None
     lowered = _fold(text).lower()
     best_name, best_len = None, 0
-    for a, b in fights:
+    for fight in fights:
+        a, b = fight_corners(fight)
         for name in (a, b):
             n = _fold(name).lower()
             if n and n in lowered and len(n) > best_len:
