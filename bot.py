@@ -19,9 +19,8 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ufc-bet-bot")
 
 INTENTS = discord.Intents.default()
-# No privileged intents needed -- everything is slash commands and
-# component interactions now (the old !eventstart/!eventend prefix
-# commands, which needed Message Content, are now /event-start and /event-end).
+# Message Content is required for prefix commands like !restart.
+INTENTS.message_content = True
 
 
 class UFCBetBot(commands.Bot):
