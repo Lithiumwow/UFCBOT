@@ -15,8 +15,23 @@ from views import BetView
 # FightIQ package lives under ./FightIQ/fightiq
 ensure_fightiq_path()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger("ufc-bet-bot")
+
+# Quiet noisy libraries / routine pollers — keep WARNING+ and our own exceptions.
+logging.getLogger("discord").setLevel(logging.WARNING)
+logging.getLogger("discord.http").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+logging.getLogger("ufc-bet-bot.grading").setLevel(logging.WARNING)
+logging.getLogger("ufc-bet-bot.leg_rematch").setLevel(logging.WARNING)
+logging.getLogger("ufc-bet-bot.card_data").setLevel(logging.WARNING)
+logging.getLogger("ufc-bet-bot.props").setLevel(logging.WARNING)
+logging.getLogger("ufc-bet-bot.bet_builder").setLevel(logging.WARNING)
+logging.getLogger("ufc-bet-bot.panel").setLevel(logging.WARNING)
 
 INTENTS = discord.Intents.default()
 # Message Content is required for prefix commands like !restart.
@@ -88,7 +103,7 @@ class UFCBetBot(commands.Bot):
             import card_data
 
             self.cached_events = await card_data.fetch_upcoming_events(limit=12)
-            log.info(
+            log.debug(
                 "Refreshed UFC event cache (%d): %s",
                 len(self.cached_events),
                 ", ".join(

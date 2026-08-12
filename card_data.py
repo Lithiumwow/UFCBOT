@@ -264,7 +264,7 @@ def _fightodds_fights_sync(event_name: str) -> list[FightCardEntry]:
         )
         return []
 
-    log.info(
+    log.debug(
         "FightOdds matched %r → pk=%s %r (score=%.1f)",
         event_name,
         best_e.pk,
@@ -372,7 +372,7 @@ async def fetch_fights_for_event(
         _fight_cache[key] = (now, fights)
         if event_name:
             _fight_cache[_norm(event_name)] = (now, fights)
-        log.info("Card for %r → %d fights", event_name or f"pk={event_pk}", len(fights))
+        log.debug("Card for %r → %d fights", event_name or f"pk={event_pk}", len(fights))
     else:
         log.warning("No fight card found for event %r", event_name or f"pk={event_pk}")
     return fights

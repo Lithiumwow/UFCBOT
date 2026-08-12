@@ -164,12 +164,23 @@ async def rematch_bets_to_card(
                     bet["opponent_pick"] = opponent
                     stats["updated_bets"] += 1
 
-    log.info(
-        "Rematch: created=%s updated_legs=%s bets=%s fighters=%s structured=%s",
-        stats["created_legs"],
-        stats["updated_legs"],
-        stats["updated_bets"],
-        stats["matched_fighters"],
-        stats["structured"],
-    )
+    if (
+        stats["created_legs"]
+        or stats["updated_legs"]
+        or stats["updated_bets"]
+        or stats["structured"]
+    ):
+        log.info(
+            "Rematch: created=%s updated_legs=%s bets=%s fighters=%s structured=%s",
+            stats["created_legs"],
+            stats["updated_legs"],
+            stats["updated_bets"],
+            stats["matched_fighters"],
+            stats["structured"],
+        )
+    else:
+        log.debug(
+            "Rematch: no changes (fighters=%s)",
+            stats["matched_fighters"],
+        )
     return stats

@@ -141,7 +141,7 @@ def try_load_prop_catalog(
         return catalog
 
     if fighter_a and fighter_b:
-        log.info(
+        log.debug(
             "Using FightIQ method fallback catalog for %s vs %s (slug=%s)",
             fighter_a,
             fighter_b,

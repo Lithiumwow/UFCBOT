@@ -539,7 +539,11 @@ class GradingCog(commands.Cog):
         if not events:
             return
 
-        log.info("Auto-grade pass for %d event(s): %s", len(events), ", ".join(sorted(events)[:8]))
+        log.debug(
+            "Auto-grade pass for %d event(s): %s",
+            len(events),
+            ", ".join(sorted(events)[:8]),
+        )
         for event in sorted(events):
             try:
                 await self._grade_event(event, prepare=True)
