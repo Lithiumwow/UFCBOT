@@ -368,10 +368,10 @@ class GradingCog(commands.Cog):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         db = self.bot.db  # type: ignore[attr-defined]
-        all_bets = await db.get_all_bets("ufc", interaction.user.id)
+        pending = await db.get_pending_bets("ufc", interaction.user.id)
         current_lower = current.lower()
         choices = []
-        for b in all_bets:
+        for b in pending:
             label = _bet_label(b)
             if current_lower and current_lower not in label.lower() and current not in str(b["id"]):
                 continue
@@ -440,32 +440,21 @@ class GradingCog(commands.Cog):
             )
             return
 
-        all_bets = await db.get_all_bets("ufc", interaction.user.id)
-        if event:
-            from card_data import _event_match_score
-            all_bets = [
-                b for b in all_bets
-                if (b.get("event") or "") and _event_match_score(event, b["event"]) >= 70
-            ]
-        if not all_bets:
+        pending = await db.get_pending_bets("ufc", interaction.user.id, event=event)
+        if not pending:
             scope = f" for **{event}**" if event else ""
             await interaction.response.send_message(
-                f"No UFC slips{scope} found. Nothing to grade.", ephemeral=True
+                f"No pending UFC slips{scope}. Nothing to grade.", ephemeral=True
             )
             return
 
-        # Pending first (most likely to actually need grading), so they
-        # can't get crowded out of the 25-option dropdown limit by a long
-        # history of already-graded bets.
-        all_bets.sort(key=lambda b: 0 if b.get("status") == "pending" else 1)
-
         await interaction.response.send_message(
             content=(
-                f"**{len(all_bets)}** slip(s)"
+                f"**{len(pending)}** pending slip(s)"
                 + (f" for **{event}**" if event else "")
-                + " — pick one to grade (already-graded ones are marked, picking one changes its result):"
+                + " — pick one to grade:"
             ),
-            view=GradeSelectView(all_bets, interaction.user.id),
+            view=GradeSelectView(pending, interaction.user.id),
         )
 
     # ---------- /edit-bet ----------
