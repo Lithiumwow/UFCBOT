@@ -136,9 +136,42 @@ def map_play_to_leg(
     if not fighter_pick:
         fighter_pick = fighter_a
 
+    fight_label = f"{fighter_a} vs {fighter_b}"
+    description = _description_with_fight(label, fight_label, fighter_a, fighter_b, outcome_type)
+
     return {
-        "description": label or f"{fighter_a} vs {fighter_b} — {outcome_type}",
+        "description": description,
         "fighter_pick": fighter_pick,
         "outcome_type": outcome_type,
         "outcome_round": outcome_round,
     }
+
+
+def _description_with_fight(
+    label: str,
+    fight_label: str,
+    fighter_a: str,
+    fighter_b: str,
+    outcome_type: str,
+) -> str:
+    """Ensure fight-level props include the matchup on the slip (e.g. O/U, END_N)."""
+    if not label:
+        return f"{fight_label} — {outcome_type}"
+
+    low = label.lower()
+    named = False
+    for name in (fighter_a, fighter_b):
+        if not name:
+            continue
+        if name.lower() in low:
+            named = True
+            break
+        last = name.split()[-1] if name.split() else ""
+        if len(last) >= 3 and re.search(rf"\b{re.escape(last)}\b", low):
+            named = True
+            break
+
+    if named:
+        return label
+    # Fight-level / totals / generic prop labels need the bout on the slip
+    return f"{fight_label} — {label}"
