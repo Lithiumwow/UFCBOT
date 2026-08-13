@@ -19,7 +19,9 @@ _AVATAR_HASH_PATH = _ASSETS / ".bot_avatar_hash"
 log = logging.getLogger("ufc-bet-bot.branding")
 
 # Public raw URLs after assets are on main (Discord thumbnails need a URL).
+# ?v= cache-busts Discord's thumbnail CDN when the PNG changes.
 _RAW_BASE = "https://raw.githubusercontent.com/Lithiumwow/UFCBOT/main/assets"
+_LOGO_VERSION = "5"
 
 _DWCS_RE = re.compile(
     r"contender\s*series|\bdwcs\b|\bdwtncs\b|dana\s*white'?s?\s*contender",
@@ -53,7 +55,7 @@ def logo_filename(brand: str) -> str:
 def event_logo_url(event: Optional[str]) -> str:
     """HTTPS URL Discord can fetch for embed thumbnails."""
     brand = event_brand(event)
-    return f"{_RAW_BASE}/{logo_filename(brand)}"
+    return f"{_RAW_BASE}/{logo_filename(brand)}?v={_LOGO_VERSION}"
 
 
 def event_logo_file(event: Optional[str]):
