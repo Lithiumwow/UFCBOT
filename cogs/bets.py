@@ -279,11 +279,17 @@ class BetsCog(commands.Cog):
         legs_by_bet_id = {
             bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets
         }
+        await interaction.response.defer(ephemeral=True)
         names = await resolve_display_names(
             self.bot,
             collect_card_user_ids(bets, legs_by_bet_id),
             guild=interaction.guild,
         )
+        fights: list = []
+        try:
+            fights = await card_data.fetch_fights_for_event(event)
+        except Exception:
+            fights = []
         embed = build_results_embed(
             title=title,
             bets=bets,
@@ -294,8 +300,9 @@ class BetsCog(commands.Cog):
             event=event,
             legs_by_bet_id=legs_by_bet_id,
             member_names=names,
+            fights=fights,
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=embed,
             view=CardShareView(
                 invoker_id=interaction.user.id,

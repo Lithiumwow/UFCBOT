@@ -93,6 +93,11 @@ async def _build_card_embed(
     names = await resolve_display_names(
         client, collect_card_user_ids(bets, legs_by_bet_id)
     )
+    fights: list = []
+    try:
+        fights = await card_data.fetch_fights_for_event(event)
+    except Exception:
+        fights = []
     return build_results_embed(
         title=event,
         bets=bets,
@@ -103,6 +108,7 @@ async def _build_card_embed(
         event=event,
         legs_by_bet_id=legs_by_bet_id,
         member_names=names,
+        fights=fights,
     )
 
 

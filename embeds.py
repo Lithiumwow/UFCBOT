@@ -10,6 +10,7 @@ betting_math.py for why these are passed in rather than read from globals.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 import discord
@@ -24,6 +25,7 @@ from betting_math import (
 )
 from branding import apply_event_logo, brand_color, brand_label, event_brand
 from bet_types import categorize_bet, effective_legs
+from card_data import resolve_fighter_on_card
 
 
 STATUS_COLOR = {
@@ -86,6 +88,49 @@ def collect_card_user_ids(
     return ids
 
 
+def _description_has_matchup(text: str) -> bool:
+    return bool(re.search(r"\bvs\.?\b", text or "", re.I))
+
+
+def _card_leg_text(
+    description: str,
+    *,
+    fighter_pick: str | None = None,
+    fights: list | None = None,
+) -> str:
+    """Ensure /card lines name the fight, not just the outcome.
+
+    Fight-level props like "Fight ends in Round 2" have no matchup in the
+    stored text. Fighter-named props like "Johnson wins in round 2" still
+    don't say who they fought. Prefix with "A vs B · …" when missing.
+    """
+    desc = (description or "").strip()
+    if not desc or not fights or _description_has_matchup(desc):
+        return desc
+
+    hit = resolve_fighter_on_card(
+        fighter_pick=fighter_pick, description=desc, fights=fights
+    )
+    if not hit:
+        return desc
+    me, _them, fight_label = hit
+
+    rest = desc
+    for prefix in (me, (me.split()[-1] if me.split() else ""), fighter_pick or ""):
+        if not prefix or len(str(prefix).strip()) < 3:
+            continue
+        stripped = re.sub(
+            rf"^{re.escape(prefix)}\b[\s,:'-]*", "", rest, count=1, flags=re.I
+        ).strip()
+        if stripped != rest:
+            rest = stripped
+            break
+    rest = rest.lstrip("·–—- ").strip()
+    if rest:
+        return f"{fight_label} · {rest}"
+    return fight_label
+
+
 def _leg_lines(
     bets: list[dict[str, Any]],
     unit_value: float,
@@ -93,6 +138,7 @@ def _leg_lines(
     singular_label: str | None = None,
     legs_by_bet_id: dict[int, list[dict[str, Any]]] | None = None,
     member_names: dict[int, str] | None = None,
+    fights: list | None = None,
 ) -> list[str]:
     """
     Straight / Prop: compact single line.
@@ -135,6 +181,11 @@ def _leg_lines(
                 desc = (row.get("description") or "").strip()
                 if not desc:
                     continue
+                desc = _card_leg_text(
+                    desc,
+                    fighter_pick=row.get("fighter_pick") or b.get("fighter_pick"),
+                    fights=fights,
+                )
                 who = names.get(row.get("added_by")) if row.get("added_by") else None
                 play_lines.append(f"▸ {desc} - {who}" if who else f"▸ {desc}")
             block = "\n".join(play_lines) if play_lines else "_No plays_"
@@ -142,17 +193,48 @@ def _leg_lines(
         elif len(legs) > 1 and singular_label:
             counter += 1
             prefix = "🤝 " if is_collab else ""
-            leg_block = "\n".join(f"▸ {leg}" for leg in legs)
+            play_lines = []
+            rows = structured_legs if structured_legs is not None else [
+                {"description": desc} for desc in legs
+            ]
+            for row in rows:
+                desc = (row.get("description") or "").strip()
+                if not desc:
+                    continue
+                desc = _card_leg_text(
+                    desc,
+                    fighter_pick=row.get("fighter_pick") or b.get("fighter_pick"),
+                    fights=fights,
+                )
+                play_lines.append(f"▸ {desc}")
+            leg_block = "\n".join(play_lines)
             lines.append(
                 f"**{prefix}{singular_label} {counter}**\n{leg_block}\n"
                 f"`{odds_str}`  ·  {units:g}u  {emoji}"
             )
         else:
-            label = (
-                " + ".join(legs)
-                if len(legs) > 1
-                else (legs[0] if legs else "Untitled bet")
-            )
+            if structured_legs:
+                parts = [
+                    _card_leg_text(
+                        (leg.get("description") or "").strip(),
+                        fighter_pick=leg.get("fighter_pick") or b.get("fighter_pick"),
+                        fights=fights,
+                    )
+                    for leg in structured_legs
+                    if (leg.get("description") or "").strip()
+                ]
+                label = " + ".join(parts) if len(parts) > 1 else (parts[0] if parts else "Untitled bet")
+            else:
+                label = (
+                    " + ".join(legs)
+                    if len(legs) > 1
+                    else (legs[0] if legs else "Untitled bet")
+                )
+                label = _card_leg_text(
+                    label,
+                    fighter_pick=b.get("fighter_pick"),
+                    fights=fights,
+                )
             if is_collab:
                 label = f"🤝 {label}"
             lines.append(f"▸ {label}  `{odds_str}`  ·  {units:g}u  {emoji}")
@@ -461,6 +543,7 @@ def build_results_embed(
     event: Optional[str] = None,
     legs_by_bet_id: Optional[dict[int, list[dict[str, Any]]]] = None,
     member_names: Optional[dict[int, str]] = None,
+    fights: Optional[list] = None,
 ) -> discord.Embed:
     won = [b for b in bets if b["status"] == "won"]
     loss = [b for b in bets if b["status"] == "loss"]
@@ -562,6 +645,7 @@ def build_results_embed(
                     singular_label=singular,
                     legs_by_bet_id=legs_map,
                     member_names=member_names,
+                    fights=fights,
                 ),
                 sep=sep,
             )
