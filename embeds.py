@@ -25,7 +25,7 @@ from betting_math import (
 )
 from branding import apply_event_logo, brand_color, brand_label, event_brand
 from bet_types import categorize_bet, effective_legs
-from card_data import resolve_fighter_on_card
+from card_data import infer_fighter_from_text, resolve_fighter_on_card
 
 
 STATUS_COLOR = {
@@ -98,14 +98,15 @@ def _card_leg_text(
     fighter_pick: str | None = None,
     fights: list | None = None,
 ) -> str:
-    """Ensure /card lines name the fight, not just the outcome.
+    """On /card, only add the matchup when the line names no fighter.
 
-    Fight-level props like "Fight ends in Round 2" have no matchup in the
-    stored text. Fighter-named props like "Johnson wins in round 2" still
-    don't say who they fought. Prefix with "A vs B · …" when missing.
+    "Charles Johnson to Win in Rd 3" stays as-is.
+    "Fight ends in Round 2" becomes "A vs B · Fight ends in Round 2".
     """
     desc = (description or "").strip()
     if not desc or not fights or _description_has_matchup(desc):
+        return desc
+    if infer_fighter_from_text(desc, fights):
         return desc
 
     hit = resolve_fighter_on_card(
@@ -113,22 +114,7 @@ def _card_leg_text(
     )
     if not hit:
         return desc
-    me, _them, fight_label = hit
-
-    rest = desc
-    for prefix in (me, (me.split()[-1] if me.split() else ""), fighter_pick or ""):
-        if not prefix or len(str(prefix).strip()) < 3:
-            continue
-        stripped = re.sub(
-            rf"^{re.escape(prefix)}\b[\s,:'-]*", "", rest, count=1, flags=re.I
-        ).strip()
-        if stripped != rest:
-            rest = stripped
-            break
-    rest = rest.lstrip("·–—- ").strip()
-    if rest:
-        return f"{fight_label} · {rest}"
-    return fight_label
+    return f"{hit[2]} · {desc}"
 
 
 def _leg_lines(
