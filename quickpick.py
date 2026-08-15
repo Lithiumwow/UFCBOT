@@ -160,6 +160,49 @@ def extract_betslip_links(payload: dict[str, Any] | None) -> list[str]:
     return found
 
 
+def format_card_bets_for_quickpick(
+    bets: list[dict[str, Any]],
+    legs_by_bet_id: dict[int, list[dict[str, Any]]] | None = None,
+    *,
+    event: Optional[str] = None,
+    viewer_id: Optional[int] = None,
+) -> str:
+    """Ticket text for every logged slip on a /card — same style Gambly/QuickPick parse."""
+    from bet_types import effective_legs
+    from betting_math import personalize_collab_bet
+    from odds_math import format_american
+
+    lines: list[str] = []
+    if event:
+        lines.append(f"Event: {event}")
+        lines.append("")
+
+    legs_map = legs_by_bet_id or {}
+    n = 0
+    for bet in bets or []:
+        row = personalize_collab_bet(bet, viewer_id) if viewer_id is not None else bet
+        descs = [
+            (leg.get("description") or "").strip()
+            for leg in effective_legs(row, legs_map.get(row.get("id")))
+            if (leg.get("description") or "").strip()
+        ]
+        if not descs:
+            continue
+        n += 1
+        odds = row.get("odds")
+        header = f"Slip {n}"
+        if odds is not None:
+            try:
+                header += f" @ {format_american(int(odds))}"
+            except (TypeError, ValueError):
+                pass
+        lines.append(header)
+        for i, desc in enumerate(descs, 1):
+            lines.append(f"{i}. {desc}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def format_collab_legs_for_quickpick(
     legs: list[dict[str, Any]],
     *,

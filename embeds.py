@@ -744,3 +744,23 @@ def build_pl_embed(
         embed.description = "*No bets logged yet for this scope.*"
 
     return embed
+
+
+BETSLIP_FIELD_NAME = "🔗 Gambly"
+
+
+def with_betslip_links(embed: discord.Embed, links: list[str]) -> discord.Embed:
+    """Copy a /card embed and attach QuickPick share links (replaces any prior field)."""
+    out = discord.Embed.from_dict(embed.to_dict())
+    kept = [f for f in out.fields if f.name != BETSLIP_FIELD_NAME]
+    out.clear_fields()
+    for field in kept:
+        out.add_field(name=field.name, value=field.value, inline=field.inline)
+    cleaned = [u.strip() for u in links if (u or "").strip()]
+    if cleaned:
+        out.add_field(
+            name=BETSLIP_FIELD_NAME,
+            value="\n".join(cleaned[:8])[:1024],
+            inline=False,
+        )
+    return out

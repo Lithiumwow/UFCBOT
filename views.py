@@ -18,10 +18,18 @@ import discord
 
 import card_data
 import chart
+import config
 from betting_math import get_user_settings, parse_stake_odds, personalize_collab_bet, format_odds
-from embeds import build_bet_embed, build_pl_embed, build_results_embed, collect_card_user_ids
+from embeds import (
+    build_bet_embed,
+    build_pl_embed,
+    build_results_embed,
+    collect_card_user_ids,
+    with_betslip_links,
+)
 from spreadsheet_image import build_event_recap_image
 from leg_rematch import rematch_bets_to_card
+from quickpick import format_card_bets_for_quickpick, request_betslip_links
 
 
 async def resolve_display_names(
@@ -392,7 +400,7 @@ class BetView(discord.ui.View):
 
 
 class CardShareView(discord.ui.View):
-    """Share button for ephemeral /card, /pl, or /spread-sheet replies."""
+    """Share (and on /card, Gambly/QuickPick) buttons for ephemeral recap replies."""
 
     def __init__(
         self,
@@ -412,12 +420,28 @@ class CardShareView(discord.ui.View):
         self.sport = sport
         self.pl_scope = pl_scope or "overall"
 
-        share_btn = discord.ui.Button(
+        self.share_btn = discord.ui.Button(
             label="📤 Share",
             style=discord.ButtonStyle.primary,
         )
-        share_btn.callback = self._share_callback
-        self.add_item(share_btn)
+        self.share_btn.callback = self._share_callback
+        self.add_item(self.share_btn)
+
+        self.betslip_links: list[str] = []
+        self.gambly_btn: discord.ui.Button | None = None
+        if kind == "card" and event:
+            self.gambly_btn = discord.ui.Button(
+                label="🔗 Gambly",
+                style=discord.ButtonStyle.secondary,
+            )
+            self.gambly_btn.callback = self._gambly_callback
+            self.add_item(self.gambly_btn)
+
+    def _set_generating(self, generating: bool) -> None:
+        self.share_btn.disabled = generating
+        if self.gambly_btn is not None:
+            self.gambly_btn.disabled = generating
+            self.gambly_btn.label = "⏳ Generating…" if generating else "🔗 Gambly"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker_id:
@@ -438,6 +462,7 @@ class CardShareView(discord.ui.View):
             pl_scope=self.pl_scope if self.kind == "pl" else None,
             pl_event=self.event if self.kind == "pl" else None,
             sheet_event=self.event if self.kind == "sheet" else None,
+            betslip_links=self.betslip_links or None,
         )
         labels = {
             "card": "card (results summary for this event)",
@@ -451,6 +476,72 @@ class CardShareView(discord.ui.View):
             view=view,
             ephemeral=True,
         )
+
+    async def _gambly_callback(self, interaction: discord.Interaction):
+        if not (getattr(config, "QUICKPICK_API_KEY", "") or "").strip():
+            await interaction.response.send_message(
+                "⚠️ `QUICKPICK_API_KEY` is not set in `.env`.",
+                ephemeral=True,
+            )
+            return
+        if not self.event:
+            await interaction.response.send_message(
+                "No event on this card to process.", ephemeral=True
+            )
+            return
+
+        self._set_generating(True)
+        await interaction.response.edit_message(view=self)
+
+        db = interaction.client.db  # type: ignore[attr-defined]
+        bets = await db.get_bets_for_event_matching(
+            self.event, self.sport, self.owner_user_id
+        )
+        if not bets:
+            self._set_generating(False)
+            await interaction.message.edit(view=self)
+            await interaction.followup.send(
+                "No bets found on this card to send.", ephemeral=True
+            )
+            return
+
+        legs_by_bet_id = {bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets}
+        text = format_card_bets_for_quickpick(
+            bets,
+            legs_by_bet_id,
+            event=self.event,
+            viewer_id=self.owner_user_id,
+        )
+        if not text:
+            self._set_generating(False)
+            await interaction.message.edit(view=self)
+            await interaction.followup.send(
+                "Couldn't build ticket text from this card.", ephemeral=True
+            )
+            return
+
+        links, raw = await request_betslip_links(text)
+        self._set_generating(False)
+        if not links:
+            await interaction.message.edit(view=self)
+            msg = (raw or {}).get("message") or (raw or {}).get("status") or "no links"
+            await interaction.followup.send(
+                f"❌ QuickPick did not return a link (`{msg}`).",
+                ephemeral=True,
+            )
+            return
+
+        embeds = interaction.message.embeds
+        if not embeds:
+            await interaction.message.edit(view=self)
+            await interaction.followup.send(
+                "Card embed is missing; can't attach the link.", ephemeral=True
+            )
+            return
+
+        self.betslip_links = links
+        updated = with_betslip_links(embeds[0], links)
+        await interaction.message.edit(embed=updated, view=self)
 
 
 class ToolShareView(discord.ui.View):
@@ -527,6 +618,7 @@ class ShareDestinationView(discord.ui.View):
         share_file_bytes: bytes | None = None,
         share_filename: str | None = None,
         share_label: str | None = None,
+        betslip_links: list[str] | None = None,
     ):
         super().__init__(timeout=180)
         self.bet_id = bet_id
@@ -542,6 +634,7 @@ class ShareDestinationView(discord.ui.View):
         self.share_file_bytes = share_file_bytes
         self.share_filename = share_filename or "tool.png"
         self.share_label = share_label or "tool result"
+        self.betslip_links = list(betslip_links or [])
 
         ch_select = discord.ui.ChannelSelect(
             placeholder="Channel in this server…",
@@ -587,6 +680,7 @@ class ShareDestinationView(discord.ui.View):
         share_file_bytes: bytes | None = None,
         share_filename: str | None = None,
         share_label: str | None = None,
+        betslip_links: list[str] | None = None,
     ) -> ShareDestinationView:
         other: list[discord.SelectOption] = []
         here = interaction.guild
@@ -621,6 +715,7 @@ class ShareDestinationView(discord.ui.View):
             share_file_bytes=share_file_bytes,
             share_filename=share_filename,
             share_label=share_label,
+            betslip_links=betslip_links,
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -680,6 +775,8 @@ class ShareDestinationView(discord.ui.View):
             if embed is None:
                 await self._reply(interaction, "Couldn't build the card summary.")
                 return
+            if self.betslip_links:
+                embed = with_betslip_links(embed, self.betslip_links)
             ok_label = f"card **{self.card_event}**"
             try:
                 await channel.send(embed=embed)
@@ -862,6 +959,7 @@ class ShareDestinationView(discord.ui.View):
             share_file_bytes=self.share_file_bytes,
             share_filename=self.share_filename,
             share_label=self.share_label,
+            betslip_links=self.betslip_links,
         )
         try:
             await interaction.edit_original_response(
@@ -897,6 +995,7 @@ class ShareGuildChannelView(discord.ui.View):
         share_file_bytes: bytes | None = None,
         share_filename: str | None = None,
         share_label: str | None = None,
+        betslip_links: list[str] | None = None,
     ):
         super().__init__(timeout=180)
         self.bet_id = bet_id
@@ -912,6 +1011,7 @@ class ShareGuildChannelView(discord.ui.View):
         self.share_file_bytes = share_file_bytes
         self.share_filename = share_filename
         self.share_label = share_label
+        self.betslip_links = list(betslip_links or [])
 
         options = [
             discord.SelectOption(
@@ -980,6 +1080,7 @@ class ShareGuildChannelView(discord.ui.View):
             share_file_bytes=self.share_file_bytes,
             share_filename=self.share_filename,
             share_label=self.share_label,
+            betslip_links=self.betslip_links,
         )
         await dest._post_to_channel(interaction, channel)
 
