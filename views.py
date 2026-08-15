@@ -18,7 +18,7 @@ import discord
 
 import card_data
 import chart
-from betting_math import get_user_settings
+from betting_math import get_user_settings, personalize_collab_bet
 from embeds import build_bet_embed, build_pl_embed, build_results_embed
 from spreadsheet_image import build_event_recap_image
 from leg_rematch import rematch_bets_to_card
@@ -51,6 +51,8 @@ async def _build_card_embed(
 ) -> discord.Embed | None:
     db = client.db  # type: ignore[attr-defined]
     bets = await db.get_bets_for_event_matching(event, sport, user_id)
+    if not bets:
+        return None
     unit_value, currency = await get_user_settings(db, user_id)
     bettor = client.get_user(user_id)
     if bettor is None:
@@ -59,6 +61,9 @@ async def _build_card_embed(
         except discord.NotFound:
             bettor = None
     icon = bettor.display_avatar.url if bettor is not None else None
+    legs_by_bet_id = {
+        bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets
+    }
     return build_results_embed(
         title=event,
         bets=bets,
@@ -66,6 +71,8 @@ async def _build_card_embed(
         currency=currency,
         icon_url=icon,
         include_bet_list=True,
+        event=event,
+        legs_by_bet_id=legs_by_bet_id,
     )
 
 
@@ -156,6 +163,41 @@ async def _build_sheet_share(
             break
 
     unit_value, currency = await get_user_settings(db, user_id)
+    owner = client.get_user(user_id)
+    if owner is None:
+        try:
+            owner = await client.fetch_user(user_id)
+        except Exception:
+            owner = None
+    avatar_bytes = None
+    if owner is not None:
+        try:
+            avatar_bytes = await owner.display_avatar.with_size(64).read()
+        except Exception:
+            avatar_bytes = None
+
+    collab_partner_names: dict[int, str] = {}
+    for bet in bets:
+        if not (bet.get("is_collab") or bet.get("co_user_id")):
+            continue
+        host = client.get_user(bet["user_id"])
+        partner = client.get_user(bet["co_user_id"]) if bet.get("co_user_id") else None
+        if host is None:
+            try:
+                host = await client.fetch_user(bet["user_id"])
+            except Exception:
+                host = None
+        if partner is None and bet.get("co_user_id"):
+            try:
+                partner = await client.fetch_user(bet["co_user_id"])
+            except Exception:
+                partner = None
+        h = host.display_name if host else str(bet["user_id"])
+        p = partner.display_name if partner else (
+            str(bet["co_user_id"]) if bet.get("co_user_id") else "?"
+        )
+        collab_partner_names[bet["id"]] = f"{h} + {p}"
+
     image_bytes = build_event_recap_image(
         event_name=event,
         event_date=event_date,
@@ -164,6 +206,9 @@ async def _build_sheet_share(
         fights=fights,
         unit_value=unit_value,
         currency=currency,
+        username=owner.display_name if owner else None,
+        avatar_bytes=avatar_bytes,
+        collab_partner_names=collab_partner_names,
     )
     safe_name = re.sub(r"[^\w\-]+", "_", event)[:60]
     content = f"📊 Recap for **{event}** ({len(bets)} bet(s))."
@@ -269,7 +314,9 @@ class BetView(discord.ui.View):
             )
             return
 
-        await interaction.response.send_modal(EditBetModal(bet))
+        await interaction.response.send_modal(
+            EditBetModal(bet, viewer_id=interaction.user.id)
+        )
 
     async def _share_callback(self, interaction: discord.Interaction):
         """Open ephemeral destination picker (this server's channels + other servers)."""
@@ -370,6 +417,60 @@ class CardShareView(discord.ui.View):
         )
 
 
+class ToolShareView(discord.ui.View):
+    """Share button for ephemeral /tool ask|predict|image|edit replies."""
+
+    def __init__(
+        self,
+        *,
+        invoker_id: int,
+        content: str,
+        file_bytes: bytes | None = None,
+        filename: str | None = None,
+        label: str = "tool result",
+    ):
+        super().__init__(timeout=600)
+        self.invoker_id = invoker_id
+        self.content = content
+        self.file_bytes = file_bytes
+        self.filename = filename or "tool.png"
+        self.label = label
+
+        share_btn = discord.ui.Button(
+            label="📤 Share",
+            style=discord.ButtonStyle.primary,
+        )
+        share_btn.callback = self._share_callback
+        self.add_item(share_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "🚫 These aren't your buttons to press.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _share_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        view = await ShareDestinationView.create(
+            invoker_id=interaction.user.id,
+            owner_user_id=interaction.user.id,
+            interaction=interaction,
+            share_content=self.content,
+            share_file_bytes=self.file_bytes,
+            share_filename=self.filename,
+            share_label=self.label,
+        )
+        await interaction.followup.send(
+            f"📤 **Share {self.label}**\n"
+            "• Use the channel menu for **this server**, or\n"
+            "• Pick **another server**, then a channel.",
+            view=view,
+            ephemeral=True,
+        )
+
+
 class ShareDestinationView(discord.ui.View):
     """Pick a channel in this server, or jump to another mutual server then channel."""
 
@@ -384,7 +485,12 @@ class ShareDestinationView(discord.ui.View):
         pl_scope: str | None = None,
         pl_event: str | None = None,
         sheet_event: str | None = None,
+        collab_session_id: int | None = None,
         owner_user_id: int | None = None,
+        share_content: str | None = None,
+        share_file_bytes: bytes | None = None,
+        share_filename: str | None = None,
+        share_label: str | None = None,
     ):
         super().__init__(timeout=180)
         self.bet_id = bet_id
@@ -393,8 +499,13 @@ class ShareDestinationView(discord.ui.View):
         self.pl_scope = pl_scope
         self.pl_event = pl_event
         self.sheet_event = sheet_event
+        self.collab_session_id = collab_session_id
         self.invoker_id = invoker_id
         self.owner_user_id = owner_user_id if owner_user_id is not None else invoker_id
+        self.share_content = share_content
+        self.share_file_bytes = share_file_bytes
+        self.share_filename = share_filename or "tool.png"
+        self.share_label = share_label or "tool result"
 
         ch_select = discord.ui.ChannelSelect(
             placeholder="Channel in this server…",
@@ -434,7 +545,12 @@ class ShareDestinationView(discord.ui.View):
         pl_scope: str | None = None,
         pl_event: str | None = None,
         sheet_event: str | None = None,
+        collab_session_id: int | None = None,
         owner_user_id: int | None = None,
+        share_content: str | None = None,
+        share_file_bytes: bytes | None = None,
+        share_filename: str | None = None,
+        share_label: str | None = None,
     ) -> ShareDestinationView:
         other: list[discord.SelectOption] = []
         here = interaction.guild
@@ -461,9 +577,14 @@ class ShareDestinationView(discord.ui.View):
             pl_scope=pl_scope,
             pl_event=pl_event,
             sheet_event=sheet_event,
+            collab_session_id=collab_session_id,
             invoker_id=invoker_id,
             owner_user_id=owner_user_id if owner_user_id is not None else invoker_id,
             other_guild_options=other,
+            share_content=share_content,
+            share_file_bytes=share_file_bytes,
+            share_filename=share_filename,
+            share_label=share_label,
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -560,6 +681,41 @@ class ShareDestinationView(discord.ui.View):
             content, image_file, ok_label = built
             try:
                 await channel.send(content=content, file=image_file)
+            except discord.HTTPException as e:
+                await self._reply(interaction, f"❌ Failed to post: {e}")
+                return
+        elif self.collab_session_id is not None:
+            from cogs.collab import build_lobby_embed
+
+            db = interaction.client.db  # type: ignore[attr-defined]
+            session = await db.get_collab_session(self.collab_session_id)
+            if not session:
+                await self._reply(interaction, "This collab no longer exists.")
+                return
+            embed = await build_lobby_embed(interaction.client, db, session)
+            ok_label = f"collab `{session['code']}`"
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException as e:
+                await self._reply(interaction, f"❌ Failed to post: {e}")
+                return
+        elif self.share_content is not None or self.share_file_bytes is not None:
+            who = interaction.user.mention
+            body = (self.share_content or "").strip()
+            header = f"📤 Shared by {who}"
+            content = f"{header}\n{body}" if body else header
+            if len(content) > 2000:
+                content = content[:1997] + "…"
+            ok_label = self.share_label or "tool result"
+            try:
+                if self.share_file_bytes is not None:
+                    file = discord.File(
+                        io.BytesIO(self.share_file_bytes),
+                        filename=self.share_filename or "tool.png",
+                    )
+                    await channel.send(content=content, file=file)
+                else:
+                    await channel.send(content=content)
             except discord.HTTPException as e:
                 await self._reply(interaction, f"❌ Failed to post: {e}")
                 return
@@ -665,6 +821,11 @@ class ShareDestinationView(discord.ui.View):
             pl_scope=self.pl_scope,
             pl_event=self.pl_event,
             sheet_event=self.sheet_event,
+            collab_session_id=self.collab_session_id,
+            share_content=self.share_content,
+            share_file_bytes=self.share_file_bytes,
+            share_filename=self.share_filename,
+            share_label=self.share_label,
         )
         try:
             await interaction.edit_original_response(
@@ -694,7 +855,12 @@ class ShareGuildChannelView(discord.ui.View):
         pl_scope: str | None = None,
         pl_event: str | None = None,
         sheet_event: str | None = None,
+        collab_session_id: int | None = None,
         owner_user_id: int | None = None,
+        share_content: str | None = None,
+        share_file_bytes: bytes | None = None,
+        share_filename: str | None = None,
+        share_label: str | None = None,
     ):
         super().__init__(timeout=180)
         self.bet_id = bet_id
@@ -703,8 +869,13 @@ class ShareGuildChannelView(discord.ui.View):
         self.pl_scope = pl_scope
         self.pl_event = pl_event
         self.sheet_event = sheet_event
+        self.collab_session_id = collab_session_id
         self.invoker_id = invoker_id
         self.owner_user_id = owner_user_id if owner_user_id is not None else invoker_id
+        self.share_content = share_content
+        self.share_file_bytes = share_file_bytes
+        self.share_filename = share_filename
+        self.share_label = share_label
 
         options = [
             discord.SelectOption(
@@ -765,9 +936,14 @@ class ShareGuildChannelView(discord.ui.View):
             pl_scope=self.pl_scope,
             pl_event=self.pl_event,
             sheet_event=self.sheet_event,
+            collab_session_id=self.collab_session_id,
             invoker_id=self.invoker_id,
             owner_user_id=self.owner_user_id,
             other_guild_options=[],
+            share_content=self.share_content,
+            share_file_bytes=self.share_file_bytes,
+            share_filename=self.share_filename,
+            share_label=self.share_label,
         )
         await dest._post_to_channel(interaction, channel)
 
@@ -878,32 +1054,39 @@ class ConfirmDeleteEventView(discord.ui.View):
 class EditBetModal(discord.ui.Modal):
     """Pre-filled form for correcting an existing bet's details."""
 
-    def __init__(self, bet: dict):
+    def __init__(self, bet: dict, viewer_id: int | None = None):
         super().__init__(title=f"Edit Bet #{bet['id']}")
         self.bet_id = bet["id"]
+        self.viewer_id = viewer_id if viewer_id is not None else bet["user_id"]
+        # Collab partner edits their own stake columns; host (and solo bets)
+        # edit the main units/odds columns.
+        self.edit_partner_side = bool(
+            bet.get("is_collab") and self.viewer_id == bet.get("co_user_id")
+        )
+        display = personalize_collab_bet(bet, self.viewer_id)
 
         self.event_input = discord.ui.TextInput(
             label="Event",
-            default=bet.get("event") or "",
+            default=display.get("event") or "",
             required=False,
             max_length=200,
         )
         self.legs_input = discord.ui.TextInput(
             label="Legs (one per line)",
             style=discord.TextStyle.paragraph,
-            default=bet.get("bet_title") or "",
+            default=display.get("bet_title") or "",
             required=False,
             max_length=1000,
         )
         self.units_input = discord.ui.TextInput(
             label="Units",
-            default=f"{bet.get('units', 1.0):g}",
+            default=f"{display.get('units', 1.0):g}",
             required=True,
             max_length=10,
         )
         self.odds_input = discord.ui.TextInput(
             label="Odds (e.g. -150 or 120, blank = none)",
-            default=(str(bet["odds"]) if bet.get("odds") is not None else ""),
+            default=(str(display["odds"]) if display.get("odds") is not None else ""),
             required=False,
             max_length=10,
         )
@@ -935,9 +1118,19 @@ class EditBetModal(discord.ui.Modal):
         bet_title = self.legs_input.value.strip() or None
 
         db = interaction.client.db  # type: ignore[attr-defined]
-        await db.update_bet_fields(
-            self.bet_id, event=event, bet_title=bet_title, units=units, odds=odds
-        )
+        if self.edit_partner_side:
+            await db.update_bet_fields(
+                self.bet_id,
+                event=event,
+                bet_title=bet_title,
+                partner_units=units,
+                partner_odds=odds,
+                edit_partner_side=True,
+            )
+        else:
+            await db.update_bet_fields(
+                self.bet_id, event=event, bet_title=bet_title, units=units, odds=odds
+            )
         updated_bet = await db.get_bet(self.bet_id)
         if not updated_bet:
             await interaction.response.send_message("Bet not found.", ephemeral=True)

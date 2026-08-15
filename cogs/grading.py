@@ -22,7 +22,7 @@ import card_data
 import config
 import espn
 import grading
-from betting_math import get_user_settings
+from betting_math import get_user_settings, personalize_collab_bet
 from checks import is_admin
 from embeds import build_bet_embed
 from leg_rematch import rematch_bets_to_card
@@ -83,7 +83,8 @@ class GradeResultView(discord.ui.View):
 
         unit_value, currency = await get_user_settings(db, interaction.user.id)
         embed = build_bet_embed(
-            updated, unit_value=unit_value, currency=currency, user=interaction.user
+            personalize_collab_bet(updated, interaction.user.id),
+            unit_value=unit_value, currency=currency, user=interaction.user,
         )
 
         # Best-effort redraw of the original bet message + persistent buttons.
@@ -201,7 +202,8 @@ class GradeDeleteConfirmView(discord.ui.View):
             return
         unit_value, currency = await get_user_settings(db, interaction.user.id)
         embed = build_bet_embed(
-            bet, unit_value=unit_value, currency=currency, user=interaction.user
+            personalize_collab_bet(bet, interaction.user.id),
+            unit_value=unit_value, currency=currency, user=interaction.user,
         )
         await interaction.response.edit_message(
             content=f"Grade **bet #{self.bet_id}** — choose a result:",
@@ -242,7 +244,8 @@ class GradeSelect(discord.ui.Select):
 
         unit_value, currency = await get_user_settings(db, interaction.user.id)
         embed = build_bet_embed(
-            bet, unit_value=unit_value, currency=currency, user=interaction.user
+            personalize_collab_bet(bet, interaction.user.id),
+            unit_value=unit_value, currency=currency, user=interaction.user,
         )
         await interaction.response.edit_message(
             content=f"Grade **bet #{bet_id}** — choose a result:",
@@ -299,7 +302,47 @@ class EditSelect(discord.ui.Select):
                 "🚫 You can only edit your own slips.", ephemeral=True
             )
             return
-        await interaction.response.send_modal(EditBetModal(bet))
+        await interaction.response.edit_message(
+            content=f"Bet **#{bet_id}** — what would you like to do?",
+            view=EditOrDeleteView(bet, interaction.user.id),
+        )
+
+
+class EditOrDeleteView(discord.ui.View):
+    """Shown once a bet is picked via /edit-bet -- Edit or Delete live
+    together here as sub-options of one command, rather than needing a
+    separate top-level command just for deleting."""
+
+    def __init__(self, bet: dict, viewer_id: int):
+        super().__init__(timeout=120)
+        self.bet = bet
+        self.viewer_id = viewer_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.viewer_id:
+            await interaction.response.send_message(
+                "🚫 This isn't your editing prompt.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="✏️ Edit Details", style=discord.ButtonStyle.primary)
+    async def edit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EditBetModal(self.bet, viewer_id=self.viewer_id))
+
+    @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger)
+    async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # A collab bet is one shared row -- either person deleting it
+        # removes it for both, there's no "just my half" to delete.
+        note = (
+            "\n\n⚠️ This is a **collab** slip — deleting it removes it for both of you."
+            if self.bet.get("is_collab") else ""
+        )
+        await interaction.response.edit_message(
+            content=f"⚠️ Permanently delete bet **#{self.bet['id']}**? This can't be undone.{note}",
+            embed=None,
+            view=GradeDeleteConfirmView(bet_id=self.bet["id"], invoker_id=self.viewer_id),
+        )
 
 
 class EditSelectView(discord.ui.View):
@@ -413,7 +456,7 @@ class GradingCog(commands.Cog):
                     f"No bet found with id **#{bid}**.", ephemeral=True
                 )
                 return
-            if bet["user_id"] != interaction.user.id:
+            if not db.user_can_access_bet(bet, interaction.user.id):
                 await interaction.response.send_message(
                     "🚫 You can only grade your own slips.", ephemeral=True
                 )
@@ -427,7 +470,8 @@ class GradingCog(commands.Cog):
 
             unit_value, currency = await get_user_settings(db, interaction.user.id)
             embed = build_bet_embed(
-                bet, unit_value=unit_value, currency=currency, user=interaction.user
+                personalize_collab_bet(bet, interaction.user.id),
+                unit_value=unit_value, currency=currency, user=interaction.user,
             )
             already_graded_note = (
                 f" (currently **{bet['status'].upper()}** — this will change it)"
@@ -461,7 +505,7 @@ class GradingCog(commands.Cog):
 
     @app_commands.command(
         name="edit-bet",
-        description="Edit a bet you've already logged (event, legs, units, odds)",
+        description="Edit or delete a bet you've already logged",
     )
     @is_admin()
     @app_commands.describe(
@@ -498,7 +542,11 @@ class GradingCog(commands.Cog):
                 )
                 return
 
-            await interaction.response.send_modal(EditBetModal(bet))
+            await interaction.response.send_message(
+                content=f"Bet **#{bid}** — what would you like to do?",
+                view=EditOrDeleteView(bet, interaction.user.id),
+                ephemeral=True,
+            )
             return
 
         all_bets = await db.get_all_bets("ufc", interaction.user.id)
@@ -928,7 +976,9 @@ class GradingCog(commands.Cog):
 
     async def _redraw_bet_message(self, bet_id: int) -> None:
         """Silently redraws a bet's embed/buttons after grading or /rescan.
-        No DM, channel notice, or debug posts."""
+        No DM, channel notice, or debug posts. For a collab bet, this is
+        the one shared/public message, so it shows BOTH people's own
+        numbers side by side, matching how it was originally posted."""
         db = self.bot.db  # type: ignore[attr-defined]
         updated_bet = await db.get_bet(bet_id)
         if updated_bet is None or not updated_bet.get("channel_id") or not updated_bet.get("message_id"):
@@ -942,8 +992,22 @@ class GradingCog(commands.Cog):
                 bettor = None
 
         unit_value, currency = await get_user_settings(db, updated_bet["user_id"])
+
+        co_user = None
+        co_unit_value = None
+        co_currency = None
+        if updated_bet.get("is_collab") and updated_bet.get("co_user_id"):
+            co_user = self.bot.get_user(updated_bet["co_user_id"])
+            if co_user is None:
+                try:
+                    co_user = await self.bot.fetch_user(updated_bet["co_user_id"])
+                except discord.NotFound:
+                    co_user = None
+            co_unit_value, co_currency = await get_user_settings(db, updated_bet["co_user_id"])
+
         embed = build_bet_embed(
-            updated_bet, unit_value=unit_value, currency=currency, user=bettor
+            updated_bet, unit_value=unit_value, currency=currency, user=bettor,
+            co_user=co_user, co_unit_value=co_unit_value, co_currency=co_currency,
         )
         try:
             channel = self.bot.get_channel(

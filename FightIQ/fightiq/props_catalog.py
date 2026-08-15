@@ -58,26 +58,6 @@ POPULAR_OFFER_TYPES = [
     "SUB_1",
     "SUB_2",
     "SUB_3",
-    "KO_1_2",
-    "KO_2_3",
-    "KO_3_4",
-    "KO_4_5",
-    "KO_1_2_3",
-    "KO_2_3_4",
-    "KO_3_4_5",
-    "SUB_1_2",
-    "SUB_2_3",
-    "SUB_3_4",
-    "SUB_4_5",
-    "SUB_1_2_3",
-    "SUB_2_3_4",
-    "SUB_3_4_5",
-    "R_1_2",
-    "R_2_3",
-    "R_3_4",
-    "R_4_5",
-    "R_1_2_3",
-    "R_3_4_5",
     "R_OVER_1.5",
     "R_OVER_2.5",
     "R_UNDER_1.5",
@@ -93,55 +73,10 @@ CATEGORY_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("distance", re.compile(r"^DISTANCE|^START_")),
     ("method_fight", re.compile(r"^END_|^DRAW$")),
     ("method_fighter", re.compile(r"^(KO|SUB|DEC|UD|SD|ID|KO_DEC|KO_SUB|SUB_DEC)$")),
-    # Method+round (SUB_2, KO_2_3, …) before bare round-winner (R_2).
-    ("round_method", re.compile(r"^(KO|SUB)_\d")),
-    ("round_fighter", re.compile(r"^R_\d")),
+    ("round_fighter", re.compile(r"^R_\d|^KO_\d|^SUB_\d|^R_\d")),
+    ("round_method", re.compile(r"^(KO|SUB)_[0-9_]+$")),
     ("other", re.compile(r".*")),
 ]
-
-# Dropped from search queries so "submission in round 2 or 3" matches
-# FightOdds labels like "wins in round 2-3 - Submission".
-_SEARCH_STOPWORDS = frozenset(
-    {
-        "a",
-        "an",
-        "and",
-        "by",
-        "for",
-        "in",
-        "of",
-        "or",
-        "the",
-        "to",
-        "vs",
-        "with",
-    }
-)
-
-
-def _search_blob(text: str) -> str:
-    """Normalize text for prop search (hyphen/slash/'or'/comma round ranges)."""
-    s = (text or "").lower()
-    # Collapse round lists: "3 or 4 or 5", "3,4,5", "3/4/5", "3_4_5" → "3-4-5"
-    for _ in range(6):
-        nxt = re.sub(r"(\d)\s*(?:or|/|,|–—-|_)\s*(\d)", r"\1-\2", s)
-        if nxt == s:
-            break
-        s = nxt
-    return s
-
-
-def _search_tokens(query: str) -> list[str]:
-    q = _search_blob(query.strip())
-    tokens = [t for t in re.split(r"\s+", q) if t and t not in _SEARCH_STOPWORDS]
-    # Common shorthand → label wording (FightOdds uses "round", users type "rd")
-    out: list[str] = []
-    for t in tokens:
-        if t in {"rd", "rds", "rnd", "rnds", "rounds"}:
-            out.append("round")
-        else:
-            out.append(t)
-    return out
 
 
 def category_for(offer_type_id: str) -> str:
@@ -246,11 +181,10 @@ class PropCatalog:
             rows = [p for p in rows if p.category == cat]
 
         if query:
-            tokens = _search_tokens(query)
+            q = query.strip().lower()
+            tokens = [t for t in re.split(r"\s+", q) if t]
             def match(p: Play) -> bool:
-                if not tokens:
-                    return True
-                blob = _search_blob(f"{p.label} {p.offer_type_id} {p.category}")
+                blob = f"{p.label} {p.offer_type_id} {p.category}".lower()
                 return all(t in blob for t in tokens)
             rows = [p for p in rows if match(p)]
 

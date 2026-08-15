@@ -50,6 +50,17 @@ def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(os.path.join(_FONT_DIR, name), size)
 
 
+def _round_avatar(data: bytes, size: int) -> Image.Image:
+    """Square RGB avatar with a circular mask (sheet background)."""
+    src = Image.open(io.BytesIO(data)).convert("RGBA")
+    src = src.resize((size, size), Image.Resampling.LANCZOS)
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+    out = Image.new("RGB", (size, size), BG)
+    out.paste(src, (0, 0), mask)
+    return out
+
+
 def _find_opponent(fighter: Optional[str], fights: list[tuple[str, str]]) -> str:
     if not fighter:
         return ""
@@ -275,17 +286,28 @@ def build_event_recap_image(
     fights: list[tuple[str, str]],
     unit_value: float,
     currency: str,
+    username: Optional[str] = None,
+    avatar_bytes: Optional[bytes] = None,
+    collab_partner_names: Optional[dict[int, str]] = None,
 ) -> bytes:
     rows: list[_Row] = []
+    partner_names = collab_partner_names or {}
+
+    def _is_collab(bet: dict[str, Any]) -> bool:
+        return bool(bet.get("is_collab")) or bet.get("co_user_id") is not None
+
+    solo_bets = [b for b in bets if not _is_collab(b)]
+    collab_bets = [b for b in bets if _is_collab(b)]
 
     grouped: dict[str, list[dict[str, Any]]] = {"Straight Pick": [], "Prop": [], "Parlay": []}
-    for bet in bets:
+    for bet in solo_bets:
         legs = effective_legs(bet, legs_by_bet_id.get(bet["id"], []))
         grouped[categorize_legs(legs)].append(bet)
 
     # Running totals per major group
     straight_units = straight_profit_u = straight_profit_c = 0.0
     prop_parlay_units = prop_parlay_profit_u = prop_parlay_profit_c = 0.0
+    collab_units = collab_profit_u = collab_profit_c = 0.0
     any_bets = False
 
     # ---------- Straight Picks ----------
@@ -444,11 +466,118 @@ def build_event_recap_image(
                 prop_parlay_profit_u += pu
                 prop_parlay_profit_c += pc or 0
 
+    # ---------- Collab slips (separate section underneath) ----------
+    if collab_bets:
+        any_bets = True
+        if solo_bets:
+            rows.append(_Row(height=10))
+        rows.append(_Row(bar_text="Collab Slips", height=28))
+        hdr = _Row(cells=_header_cells("Fight", "Pick"), height=24)
+        hdr.bar_bg = HEADER_BG
+        rows.append(hdr)
+
+        for c_i, bet in enumerate(collab_bets):
+            legs = effective_legs(bet, legs_by_bet_id.get(bet["id"], []))
+            status = bet.get("status")
+            overall = _result_letter(status)
+            pu, pc, roi = _settled_metrics(bet, unit_value)
+            band = PARLAY_BAND if c_i % 2 == 1 else None
+            partners = partner_names.get(bet["id"])
+            label = f"Collab #{bet['id']}"
+            if partners:
+                label = f"Collab · {partners}"
+
+            # Banner row naming the collab / partners
+            banner = _Row(
+                cells=[
+                    (label, TEXT, True),
+                    ("", TEXT, False),
+                    ("", TEXT, False),
+                    ("", TEXT, False),
+                    ("", TEXT, False),
+                    ("", TEXT, False),
+                    ("", TEXT, False),
+                    ("", TEXT, False),
+                ],
+                height=22,
+            )
+            banner.bar_bg = SECTION_TOTAL_BG
+            rows.append(banner)
+
+            if not legs:
+                # Fallback: single free-text title row
+                cells = _data_cells(
+                    col0="",
+                    col1=bet.get("bet_title") or "Collab slip",
+                    result=overall,
+                    odds=bet.get("odds"),
+                    units=bet.get("units"),
+                    profit_units=pu,
+                    profit_cash=pc,
+                    roi=roi,
+                    currency=currency,
+                    settled=status in ("won", "loss"),
+                )
+                rows.append(_Row(cells=cells, height=24, is_parlay_boundary=True))
+            else:
+                for i, leg in enumerate(legs):
+                    fighter = _resolve_fighter(leg, fights)
+                    fight = _fight_label(fighter, fights) if fighter else ""
+                    pick = _prop_pick_text(leg)
+                    is_first = i == 0
+                    is_last = i == len(legs) - 1
+                    cells = _data_cells(
+                        col0=fight,
+                        col1=pick,
+                        result=overall if is_last else "",
+                        odds=bet.get("odds") if is_first else None,
+                        units=bet.get("units") if is_first else None,
+                        profit_units=pu if is_first else None,
+                        profit_cash=pc if is_first else None,
+                        roi=roi if is_first else None,
+                        currency=currency,
+                        settled=is_first and status in ("won", "loss"),
+                        bold_left=True,
+                    )
+                    leg_row = _Row(
+                        cells=cells,
+                        height=24,
+                        group_end=is_last,
+                        is_parlay_boundary=is_last,
+                    )
+                    leg_row.bar_bg = band
+                    rows.append(leg_row)
+
+            rows.append(_Row(height=6))
+
+            units = bet.get("units") or 0
+            collab_units += units
+            if pu is not None:
+                collab_profit_u += pu
+                collab_profit_c += pc or 0
+
+        c_roi = (
+            (collab_profit_c / (collab_units * unit_value)) if collab_units else None
+        )
+        tot = _Row(
+            cells=_totals_cells(
+                "Collab Event Totals:",
+                collab_units,
+                collab_profit_u,
+                collab_profit_c,
+                c_roi,
+                currency,
+            ),
+            height=28,
+        )
+        tot.bar_bg = SECTION_TOTAL_BG
+        rows.append(tot)
+
     # ---------- Grand event total only (no gray subtotal bar above it) ----------
     if any_bets:
-        grand_units = straight_units + prop_parlay_units
-        grand_pu = straight_profit_u + prop_parlay_profit_u
-        grand_pc = straight_profit_c + prop_parlay_profit_c
+        grand_units = straight_units + prop_parlay_units + collab_units
+        grand_pu = straight_profit_u + prop_parlay_profit_u + collab_profit_u
+        grand_pc = straight_profit_c + prop_parlay_profit_c + collab_profit_c
         # ROI vs settled stake only (pending units shouldn't shrink ROI)
         settled_stake_u = 0.0
         for bet in bets:
@@ -457,7 +586,7 @@ def build_event_recap_image(
         grand_roi = (grand_pc / (settled_stake_u * unit_value)) if settled_stake_u else None
         grand = _Row(
             cells=_totals_cells(
-                "Event Totals (Props, Parlays & Straight Bets):",
+                "Event Totals (Props, Parlays, Straights & Collabs):",
                 grand_units,
                 grand_pu,
                 grand_pc,
@@ -470,15 +599,26 @@ def build_event_recap_image(
         grand.bar_bg = TOTAL_BG if grand_pu >= 0 else TOTAL_LOSS_BG
         rows.append(grand)
 
-    # ---------- render table + top-right units panel (same light sheet) ----------
+    # ---------- render table + top-right username + units panel ----------
     title = _clean(event_name) + (f", {event_date}" if event_date else "")
     title_font = _font(16, bold=True)
+    name_font = _font(13, bold=True)
     section_font = _font(13, bold=True)
     cell_font = _font(11, bold=False)
     cell_bold_font = _font(11, bold=True)
 
     padding = 18
     col_gap = 14
+
+    display_name = _clean(username) if username else ""
+    avatar_size = 32
+    avatar_gap = 8
+    avatar_img: Optional[Image.Image] = None
+    if avatar_bytes:
+        try:
+            avatar_img = _round_avatar(avatar_bytes, avatar_size)
+        except Exception:
+            avatar_img = None
 
     panel_img: Optional[Image.Image] = None
     panel_bytes = chart.build_sheet_units_panel(bets, unit_value, width_px=340, height_px=168)
@@ -515,14 +655,22 @@ def build_event_recap_image(
 
     content_width = col_x[-1] + col_widths[-1] + padding
     title_w = int(measure_draw.textlength(title, font=title_font)) + padding * 2
+    name_w = int(measure_draw.textlength(display_name, font=name_font)) if display_name else 0
+    name_h = 20 if display_name else 0
+    identity_w = (avatar_size + avatar_gap if avatar_img else 0) + name_w
+    identity_h = max(avatar_size if avatar_img else 0, name_h)
 
     panel_w = panel_img.width if panel_img else 0
     panel_h = panel_img.height if panel_img else 0
-    header_height = max(36, panel_h + 8) if panel_img else 32
+    has_identity = bool(display_name or avatar_img)
+    name_gap = 8 if has_identity and panel_img else 0
+    right_stack_h = identity_h + name_gap + panel_h
+    right_stack_w = max(panel_w, identity_w)
+    header_height = max(36, right_stack_h + 8) if (panel_img or has_identity) else 32
     width = max(
         content_width,
-        title_w + (panel_w + padding if panel_img else 0),
-        panel_w + padding * 2,
+        title_w + (right_stack_w + padding if right_stack_w else 0),
+        right_stack_w + padding * 2,
     )
 
     total_height = padding * 2 + header_height + sum(r.height for r in rows) + 4
@@ -530,12 +678,26 @@ def build_event_recap_image(
     img = Image.new("RGB", (width, total_height), BG)
     draw = ImageDraw.Draw(img)
 
-    # Title left, light units panel top-right
-    title_y = padding + max(0, (header_height - 20) // 2) if panel_img else padding
+    # Title left; avatar + username + light units panel stacked top-right
+    title_y = padding + max(0, (header_height - 20) // 2) if (panel_img or has_identity) else padding
     draw.text((padding, title_y), title, font=title_font, fill=TEXT)
+    right_y = padding
+    if has_identity:
+        ix = width - padding - identity_w
+        if avatar_img is not None:
+            img.paste(avatar_img, (ix, right_y + max(0, (identity_h - avatar_size) // 2)))
+            ix += avatar_size + avatar_gap
+        if display_name:
+            draw.text(
+                (ix, right_y + max(0, (identity_h - name_h) // 2)),
+                display_name,
+                font=name_font,
+                fill=TEXT,
+            )
+        right_y += identity_h + name_gap
     if panel_img is not None:
         px = width - padding - panel_w
-        py = padding
+        py = right_y
         draw.rectangle(
             [px - 1, py - 1, px + panel_w, py + panel_h],
             outline=GRID,

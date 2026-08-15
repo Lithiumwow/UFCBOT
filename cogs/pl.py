@@ -7,7 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import chart
-from betting_math import get_user_settings
+from betting_math import get_user_settings, personalize_collab_bet
 from checks import is_admin, resolve_allowed_target, target_user_id_from_namespace
 from embeds import build_pl_embed
 from views import CardShareView
@@ -81,6 +81,7 @@ class PLCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
+            bets = [personalize_collab_bet(b, owner_id) for b in bets]
             embed = build_pl_embed(
                 title=f"P/L — {event}{whose}",
                 bets=bets,
@@ -93,6 +94,7 @@ class PLCog(commands.Cog):
             share_event = event
         else:
             bets = await db.get_all_bets("ufc", owner_id)
+            bets = [personalize_collab_bet(b, owner_id) for b in bets]
             embed = build_pl_embed(
                 title=f"P/L — Overall (All-Time UFC){whose}",
                 bets=bets,

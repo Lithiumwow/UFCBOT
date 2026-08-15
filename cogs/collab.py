@@ -20,10 +20,10 @@ from discord.ext import commands
 import card_data
 import config
 from bet_builder import BetBuilderSession, BuilderView
-from betting_math import get_user_settings
+from betting_math import get_user_settings, personalize_collab_bet
 from checks import is_admin
 from embeds import build_bet_embed
-from views import BetView
+from views import BetView, ShareDestinationView
 
 COLLAB_MAX_LEGS_PER_USER = 3
 _CODE_ALPHABET = string.ascii_uppercase + string.digits
@@ -39,43 +39,62 @@ def _mention(user_id: Optional[int]) -> str:
     return f"<@{user_id}>"
 
 
-async def _resolve_display(bot: commands.Bot, user_id: int) -> str:
+async def _resolve_user(bot: commands.Bot, user_id: int) -> Optional[discord.abc.User]:
     user = bot.get_user(user_id)
+    if user is not None:
+        return user
+    try:
+        return await bot.fetch_user(user_id)
+    except discord.HTTPException:
+        return None
+
+
+async def _resolve_display(bot: commands.Bot, user_id: int) -> str:
+    user = await _resolve_user(bot, user_id)
     if user is None:
-        try:
-            user = await bot.fetch_user(user_id)
-        except discord.HTTPException:
-            return f"User {user_id}"
+        return f"User {user_id}"
     return user.display_name
+
+
+async def _member_line(bot: commands.Bot, user_id: int) -> str:
+    user = await _resolve_user(bot, user_id)
+    if user is None:
+        return f"User {user_id}"
+    return f"{user.display_name} · @{user.name}"
+
+
+def _fmt_stake(units: Optional[float], odds: Optional[int]) -> str:
+    if units is None:
+        return "⏳ not submitted yet"
+    odds_text = f"+{odds}" if (odds is not None and odds > 0) else (str(odds) if odds is not None else "no odds")
+    return f"✅ {units:g}u @ {odds_text}"
 
 
 async def build_lobby_embed(
     bot: commands.Bot, db, session: dict
 ) -> discord.Embed:
     legs = await db.get_collab_legs(session["id"])
-    host_name = await _resolve_display(bot, session["host_user_id"])
     partner_id = session.get("partner_user_id")
-    partner_name = await _resolve_display(bot, partner_id) if partner_id else None
 
     embed = discord.Embed(
         title="🤝 Collab Slip",
         description=(
             f"**Event:** {session.get('event') or 'TBD'}\n"
-            f"**Invite code:** `{session['code']}`\n"
-            f"Partner can press **Join**, or run `/collab join code:{session['code']}`"
+            f"**Invite code:** `{session['code']}`"
         ),
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="Host", value=f"{host_name} · {_mention(session['host_user_id'])}", inline=True)
-    embed.add_field(
-        name="Partner",
-        value=(
-            f"{partner_name} · {_mention(partner_id)}"
-            if partner_id
-            else "_(open — waiting for partner)_"
-        ),
-        inline=True,
-    )
+
+    host_line = await _member_line(bot, session["host_user_id"])
+    host_line += f"\n{_fmt_stake(session.get('host_units'), session.get('host_odds'))}"
+    member_lines = [host_line]
+    if partner_id:
+        partner_line = await _member_line(bot, partner_id)
+        partner_line += f"\n{_fmt_stake(session.get('partner_units'), session.get('partner_odds'))}"
+        member_lines.append(partner_line)
+    else:
+        member_lines.append("_Waiting for partner_")
+    embed.add_field(name="Members (each sets their own units & odds)", value="\n\n".join(member_lines), inline=False)
 
     if not legs:
         embed.add_field(name="Legs", value="_No plays yet — each of you add at least one._", inline=False)
@@ -86,22 +105,10 @@ async def build_lobby_embed(
             lines.append(f"**{i}.** {leg['description']}  · _{who}_")
         embed.add_field(name="Legs", value="\n".join(lines)[:1000], inline=False)
 
-    host_legs = sum(1 for L in legs if L["user_id"] == session["host_user_id"])
-    partner_legs = (
-        sum(1 for L in legs if L["user_id"] == partner_id) if partner_id else 0
-    )
-    ready = bool(partner_id and host_legs >= 1 and partner_legs >= 1)
-    embed.set_footer(
-        text=(
-            "Ready to finalize — host presses Finalize."
-            if ready
-            else "Need: partner joined + ≥1 play from each collaborator."
-        )
-    )
     return embed
 
 
-class FinalizeCollabModal(discord.ui.Modal, title="Finalize Collab Slip"):
+class FinalizeCollabModal(discord.ui.Modal, title="Set Your Stake"):
     def __init__(self, cog: "CollabCog", session_id: int):
         super().__init__()
         self.cog = cog
@@ -136,7 +143,7 @@ class FinalizeCollabModal(discord.ui.Modal, title="Finalize Collab Slip"):
                 )
                 return
 
-        await self.cog.finalize_session(interaction, self.session_id, units, odds)
+        await self.cog.submit_stake(interaction, self.session_id, units, odds)
 
 
 class CollabLobbyView(discord.ui.View):
@@ -207,16 +214,17 @@ class CollabLobbyView(discord.ui.View):
                 "This collab is closed.", ephemeral=True
             )
             return
-        if interaction.user.id != session["host_user_id"]:
-            await interaction.response.send_message(
-                "Only the host can finalize the slip.", ephemeral=True
-            )
-            return
 
         partner_id = session.get("partner_user_id")
         if not partner_id:
             await interaction.response.send_message(
                 "Wait for a partner to join first.", ephemeral=True
+            )
+            return
+
+        if interaction.user.id not in (session["host_user_id"], partner_id):
+            await interaction.response.send_message(
+                "Only collab members can finalize.", ephemeral=True
             )
             return
 
@@ -239,7 +247,36 @@ class CollabLobbyView(discord.ui.View):
             FinalizeCollabModal(self.cog, self.session_id)
         )
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(label="📤 Share", style=discord.ButtonStyle.primary, row=1)
+    async def share_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = await self._session(interaction)
+        if not session:
+            await interaction.response.send_message(
+                "Collab not found.", ephemeral=True
+            )
+            return
+        uid = interaction.user.id
+        if uid not in (session["host_user_id"], session.get("partner_user_id")):
+            await interaction.response.send_message(
+                "Only collab members can share this slip.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        view = await ShareDestinationView.create(
+            invoker_id=interaction.user.id,
+            interaction=interaction,
+            collab_session_id=self.session_id,
+        )
+        await interaction.followup.send(
+            "📤 **Share collab slip**\n"
+            "• Use the channel menu for **this server**, or\n"
+            "• Pick **another server**, then a channel.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=2)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         db = interaction.client.db  # type: ignore[attr-defined]
         session = await self._session(interaction)
@@ -410,13 +447,16 @@ class CollabCog(
         )
         builder.message = message
 
-    async def finalize_session(
+    async def submit_stake(
         self,
         interaction: discord.Interaction,
         session_id: int,
         units: float,
         odds: Optional[int],
     ) -> None:
+        """Records the caller's own units/odds independently. Once BOTH
+        the host and partner have submitted their own stake, the bet
+        actually gets created -- not before."""
         db = self.bot.db  # type: ignore[attr-defined]
         session = await db.get_collab_session(session_id)
         if not session or session["status"] != "open":
@@ -424,40 +464,64 @@ class CollabCog(
                 "This collab is already closed.", ephemeral=True
             )
             return
-        if interaction.user.id != session["host_user_id"]:
+
+        side = await db.set_collab_stake(session_id, interaction.user.id, units, odds)
+        if side is None:
             await interaction.response.send_message(
-                "Only the host can finalize.", ephemeral=True
+                "You're not part of this collab.", ephemeral=True
             )
             return
 
-        partner_id = session.get("partner_user_id")
-        if not partner_id:
-            await interaction.response.send_message(
-                "Need a partner first.", ephemeral=True
+        session = await db.get_collab_session(session_id)  # re-fetch with the new stake saved
+        both_ready = (
+            session.get("host_units") is not None and session.get("partner_units") is not None
+        )
+
+        if not both_ready:
+            other_id = (
+                session["partner_user_id"] if side == "host" else session["host_user_id"]
             )
+            other_name = await _resolve_display(self.bot, other_id)
+            odds_text = (
+                f"+{odds}" if (odds is not None and odds > 0)
+                else (str(odds) if odds is not None else "no odds")
+            )
+            await interaction.response.send_message(
+                f"✅ Your stake is set: **{units:g}u @ {odds_text}**. Waiting on "
+                f"**{other_name}** to set theirs too — the slip finalizes once both are in.",
+                ephemeral=True,
+            )
+            await self.refresh_lobby_message(interaction.client, session_id)
             return
+
+        await interaction.response.defer(ephemeral=True)
+        await self._create_collab_bet(interaction, session)
+
+    async def _create_collab_bet(self, interaction: discord.Interaction, session: dict) -> None:
+        """Both members have now submitted their own stake -- create the
+        one shared bet row (host's own stake in units/odds, partner's in
+        partner_units/partner_odds), post confirmations, and close out
+        the lobby message."""
+        db = self.bot.db  # type: ignore[attr-defined]
+        session_id = session["id"]
+        host_id = session["host_user_id"]
+        partner_id = session["partner_user_id"]
 
         collab_legs = await db.get_collab_legs(session_id)
-        host_n = sum(1 for L in collab_legs if L["user_id"] == session["host_user_id"])
-        partner_n = sum(1 for L in collab_legs if L["user_id"] == partner_id)
-        if host_n < 1 or partner_n < 1:
-            await interaction.response.send_message(
-                "Each collaborator needs at least one play.", ephemeral=True
-            )
-            return
-
         bet_title = "\n".join(L["description"] for L in collab_legs)
         bet_id = await db.add_bet(
-            user_id=session["host_user_id"],
+            user_id=host_id,
             guild_id=session.get("guild_id") or interaction.guild_id,
             channel_id=session.get("channel_id") or interaction.channel_id,
             event=session.get("event"),
             bet_title=bet_title,
-            units=units,
-            odds=odds,
+            units=session["host_units"],
+            odds=session["host_odds"],
             sport="ufc",
             co_user_id=partner_id,
             is_collab=True,
+            partner_units=session["partner_units"],
+            partner_odds=session["partner_odds"],
         )
         for idx, leg in enumerate(collab_legs):
             await db.add_bet_leg(
@@ -473,28 +537,57 @@ class CollabCog(
         await db.set_collab_status(session_id, "finalized")
 
         bet_row = await db.get_bet(bet_id)
-        unit_value, currency = await get_user_settings(db, interaction.user.id)
-        host = interaction.user
-        partner = self.bot.get_user(partner_id)
-        if partner is None:
-            try:
-                partner = await self.bot.fetch_user(partner_id)
-            except discord.HTTPException:
-                partner = None
+        host = self.bot.get_user(host_id) or await self._safe_fetch_user(host_id)
+        partner = self.bot.get_user(partner_id) or await self._safe_fetch_user(partner_id)
+        host_unit_value, host_currency = await get_user_settings(db, host_id)
+        partner_unit_value, partner_currency = await get_user_settings(db, partner_id)
 
+        # Confirmation to whoever just completed the finalize (could be
+        # either side) -- personalized to just THEM (no co_user here, or
+        # it'd trigger the dual-stake display meant for the shared view).
+        viewer_bet = personalize_collab_bet(bet_row, interaction.user.id)
+        viewer_unit_value, viewer_currency = await get_user_settings(db, interaction.user.id)
         embed = build_bet_embed(
-            bet_row,
-            unit_value=unit_value,
-            currency=currency,
-            user=host,
-            co_user=partner,
+            viewer_bet, unit_value=viewer_unit_value, currency=viewer_currency, user=host,
         )
         view = BetView(bet_id)
-
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        message = await interaction.original_response()
-        await db.set_message_id(bet_id, message.id)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
         interaction.client.add_view(view)  # type: ignore[attr-defined]
+
+        # Best-effort: also let the OTHER member know, with their own
+        # personalized numbers (also single-person, no dual-stake here).
+        other_id = partner_id if interaction.user.id == host_id else host_id
+        try:
+            other_user = self.bot.get_user(other_id) or await self._safe_fetch_user(other_id)
+            if other_user is not None:
+                other_bet = personalize_collab_bet(bet_row, other_id)
+                other_unit_value, other_currency = await get_user_settings(db, other_id)
+                other_embed = build_bet_embed(
+                    other_bet, unit_value=other_unit_value, currency=other_currency, user=host,
+                )
+                await other_user.send(
+                    content=f"🤝 Your collab slip (bet #{bet_id}) is finalized!",
+                    embed=other_embed,
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            pass  # DMs closed or otherwise unreachable -- not fatal
+
+        # Public, permanent record with BOTH people's real numbers side by
+        # side -- a single Discord message can't show different things to
+        # different viewers, so this is the one place both stakes are
+        # visible together, using each person's own currency.
+        canonical_embed = build_bet_embed(
+            bet_row, unit_value=host_unit_value, currency=host_currency, user=host, co_user=partner,
+            co_unit_value=partner_unit_value, co_currency=partner_currency,
+        )
+        public_channel = interaction.channel
+        canonical_message = None
+        try:
+            canonical_message = await public_channel.send(embed=canonical_embed, view=BetView(bet_id))
+            interaction.client.add_view(BetView(bet_id))  # type: ignore[attr-defined]
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await db.set_message_id(bet_id, canonical_message.id if canonical_message else None)
 
         if session.get("message_id") and session.get("channel_id"):
             channel = interaction.client.get_channel(session["channel_id"])
@@ -509,13 +602,20 @@ class CollabCog(
                     await lobby.edit(
                         content=(
                             f"✅ Collab `{session['code']}` finalized as bet **#{bet_id}** "
-                            f"· {_mention(session['host_user_id'])} + {_mention(partner_id)}"
+                            f"· {_mention(host_id)} + {_mention(partner_id)}"
                         ),
                         embed=None,
                         view=None,
                     )
                 except discord.HTTPException:
                     pass
+
+    async def _safe_fetch_user(self, user_id: int) -> Optional[discord.abc.User]:
+        try:
+            return await self.bot.fetch_user(user_id)
+        except discord.HTTPException:
+            return None
+
 
     @app_commands.command(name="start", description="Start a collab slip and invite a partner")
     @is_admin()

@@ -45,6 +45,9 @@ class ResultsUFCCog(commands.GroupCog, name="results-ufc", description="Show you
             return
 
         unit_value, currency = await get_user_settings(db, interaction.user.id)
+        legs_by_bet_id = {
+            bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets
+        }
         embed = build_results_embed(
             title="UFC — All-Time Results",
             bets=bets,
@@ -55,6 +58,7 @@ class ResultsUFCCog(commands.GroupCog, name="results-ufc", description="Show you
             include_biggest_wins=True,
             include_bet_list=True,
             bet_list_limit=25,
+            legs_by_bet_id=legs_by_bet_id,
         )
 
         chart_bytes = chart.build_profit_chart(bets, unit_value, currency)
@@ -84,6 +88,9 @@ class ResultsUFCCog(commands.GroupCog, name="results-ufc", description="Show you
             return
 
         unit_value, currency = await get_user_settings(db, interaction.user.id)
+        legs_by_bet_id = {
+            bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets
+        }
         embed = build_results_embed(
             title=event,
             bets=bets,
@@ -91,6 +98,8 @@ class ResultsUFCCog(commands.GroupCog, name="results-ufc", description="Show you
             currency=currency,
             icon_url=interaction.user.display_avatar.url,
             include_bet_list=True,
+            event=event,
+            legs_by_bet_id=legs_by_bet_id,
         )
         await interaction.response.send_message(embed=embed)
 

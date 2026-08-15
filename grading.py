@@ -23,10 +23,10 @@ from typing import Any, Optional
 
 _TOTAL_ROUNDS_RE = re.compile(r"^(OVER|UNDER)_(\d)_5$")
 _ROUND_WIN_RE = re.compile(r"^R_(\d)$")
-_ROUND_WIN_COMBO_RE = re.compile(r"^R_(\d+(?:_\d+)+)$")
+_ROUND_WIN_COMBO_RE = re.compile(r"^R_(\d)_(\d)$")
 _ROUND_OR_DEC_RE = re.compile(r"^R_(\d+(?:_\d+)*)_DEC$")
 _METHOD_ROUND_RE = re.compile(r"^(KO|SUB)_(\d)$")
-_METHOD_ROUND_COMBO_RE = re.compile(r"^(KO|SUB)_(\d+(?:_\d+)+)$")
+_METHOD_ROUND_COMBO_RE = re.compile(r"^(KO|SUB)_(\d)_(\d)$")
 _END_ROUND_RE = re.compile(r"^END_(\d)$")
 _START_ROUND_RE = re.compile(r"^START_(\d)$")
 
@@ -287,7 +287,7 @@ def grade_bet(bet: dict[str, Any], result: dict[str, Any]) -> Optional[tuple[str
         return ("won" if actual == want else "loss", True)
 
     if m := _ROUND_WIN_COMBO_RE.match(outcome_type):
-        want = {int(x) for x in m.group(1).split("_")}
+        want = {int(m.group(1)), int(m.group(2))}
         if round_num is None and end_round is None:
             return None
         actual = int(round_num if round_num is not None else end_round)
@@ -309,7 +309,7 @@ def grade_bet(bet: dict[str, Any], result: dict[str, Any]) -> Optional[tuple[str
 
     if m := _METHOD_ROUND_COMBO_RE.match(outcome_type):
         need_raw = m.group(1).upper()
-        want = {int(x) for x in m.group(2).split("_")}
+        want = {int(m.group(2)), int(m.group(3))}
         need = "KO_TKO" if need_raw == "KO" else need_raw
         if method is None:
             return None

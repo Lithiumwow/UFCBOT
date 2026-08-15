@@ -47,3 +47,27 @@ def format_american(american: int | None) -> str:
         return "n/a"
     a = int(american)
     return f"+{a}" if a > 0 else str(a)
+
+
+def parse_odds_input(raw: str) -> int:
+    """
+    Parse American or decimal odds into American int.
+
+    Examples: ``-110``, ``+150``, ``150``, ``1.91``, ``2.50``
+    A decimal point means decimal odds; otherwise American.
+    """
+    s = (raw or "").strip().replace(",", "").replace(" ", "")
+    if not s:
+        raise ValueError("Odds are required")
+    if "." in s:
+        d = Decimal(s)
+        if d <= Decimal("1"):
+            raise ValueError(f"Decimal odds must be > 1, got {s}")
+        return decimal_to_american(d)
+    # Strip leading + for int()
+    if s.startswith("+"):
+        s = s[1:]
+    a = int(s)
+    if a == 0:
+        raise ValueError("American odds cannot be 0")
+    return a

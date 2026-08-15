@@ -191,11 +191,9 @@ def _fighter_side_fallback(play: Any, fighter_a: str, fighter_b: str) -> str:
 def _is_fighter_specific(outcome_type: str) -> bool:
     if outcome_type in _FIGHTER_SPECIFIC_DIRECT:
         return True
-    if re.match(r"^(KO|SUB)_\d(?:_\d)+$", outcome_type) or re.match(
-        r"^(KO|SUB)_\d$", outcome_type
-    ):
+    if re.match(r"^(KO|SUB)_\d(_\d)?$", outcome_type):  # KO_2 or KO_1_2
         return True
-    if re.match(r"^R_\d(?:_\d)*$", outcome_type):  # R_3 or R_1_2 or R_3_4_5
+    if re.match(r"^R_\d(_\d)?$", outcome_type):  # R_3 or R_1_2
         return True
     if re.match(r"^R_\d+(?:_\d+)*_DEC$", outcome_type):  # R_4_5_DEC
         return True

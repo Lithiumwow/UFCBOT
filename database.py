@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS bets (
     outcome_type  TEXT,
     outcome_round INTEGER,
     co_user_id    INTEGER,
-    is_collab     INTEGER NOT NULL DEFAULT 0
+    is_collab     INTEGER NOT NULL DEFAULT 0,
+    partner_units REAL,
+    partner_odds  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS predictions (
@@ -84,7 +86,11 @@ CREATE TABLE IF NOT EXISTS collab_sessions (
     channel_id      INTEGER,
     message_id      INTEGER,
     status          TEXT NOT NULL DEFAULT 'open',
-    created_at      TEXT NOT NULL
+    created_at      TEXT NOT NULL,
+    host_units      REAL,
+    host_odds       INTEGER,
+    partner_units   REAL,
+    partner_odds    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS collab_legs (
@@ -97,6 +103,17 @@ CREATE TABLE IF NOT EXISTS collab_legs (
     outcome_type  TEXT,
     outcome_round INTEGER,
     created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS openai_usage (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at        TEXT NOT NULL,
+    model             TEXT,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    source            TEXT,
+    user_id           INTEGER
 );
 """
 
@@ -132,6 +149,12 @@ class Database:
             "ALTER TABLE bets ADD COLUMN co_user_id INTEGER",
             "ALTER TABLE bets ADD COLUMN is_collab INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE bet_legs ADD COLUMN added_by INTEGER",
+            "ALTER TABLE bets ADD COLUMN partner_units REAL",
+            "ALTER TABLE bets ADD COLUMN partner_odds INTEGER",
+            "ALTER TABLE collab_sessions ADD COLUMN host_units REAL",
+            "ALTER TABLE collab_sessions ADD COLUMN host_odds INTEGER",
+            "ALTER TABLE collab_sessions ADD COLUMN partner_units REAL",
+            "ALTER TABLE collab_sessions ADD COLUMN partner_odds INTEGER",
         ):
             try:
                 await self._conn.execute(statement)
@@ -162,14 +185,16 @@ class Database:
         outcome_round: Optional[int] = None,
         co_user_id: Optional[int] = None,
         is_collab: bool = False,
+        partner_units: Optional[float] = None,
+        partner_odds: Optional[int] = None,
     ) -> int:
         cursor = await self._conn.execute(
             """
             INSERT INTO bets (user_id, guild_id, channel_id, sport, event, bet_title,
                                units, odds, status, created_at, stake_gbp, returns_gbp,
                                fighter_pick, opponent_pick, outcome_type, outcome_round,
-                               co_user_id, is_collab)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               co_user_id, is_collab, partner_units, partner_odds)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -189,6 +214,8 @@ class Database:
                 outcome_round,
                 co_user_id,
                 1 if is_collab else 0,
+                partner_units,
+                partner_odds,
             ),
         )
         await self._conn.commit()
@@ -233,14 +260,30 @@ class Database:
         *,
         event: Optional[str],
         bet_title: Optional[str],
-        units: float,
-        odds: Optional[int],
+        units: Optional[float] = None,
+        odds: Optional[int] = None,
+        partner_units: Optional[float] = None,
+        partner_odds: Optional[int] = None,
+        edit_partner_side: bool = False,
     ) -> None:
-        await self._conn.execute(
-            "UPDATE bets SET event = ?, bet_title = ?, units = ?, odds = ?, "
-            "stake_gbp = NULL, returns_gbp = NULL WHERE id = ?",
-            (event, bet_title, units, odds, bet_id),
-        )
+        """By default updates the bet's own event/title/units/odds (the
+        host's stake, for a collab bet). Pass edit_partner_side=True to
+        instead update partner_units/partner_odds (leaving the host's
+        stake untouched) -- used when the collab partner is the one
+        editing, so they can never accidentally overwrite the host's
+        numbers with their own."""
+        if edit_partner_side:
+            await self._conn.execute(
+                "UPDATE bets SET event = ?, bet_title = ?, partner_units = ?, partner_odds = ? "
+                "WHERE id = ?",
+                (event, bet_title, partner_units, partner_odds, bet_id),
+            )
+        else:
+            await self._conn.execute(
+                "UPDATE bets SET event = ?, bet_title = ?, units = ?, odds = ?, "
+                "stake_gbp = NULL, returns_gbp = NULL WHERE id = ?",
+                (event, bet_title, units, odds, bet_id),
+            )
         await self._conn.commit()
 
     # ---------- reads ----------
@@ -516,6 +559,77 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    # ---------- OpenAI usage tracking (/bet-slip Vision) ----------
+
+    async def record_openai_usage(
+        self,
+        *,
+        model: str | None,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int | None = None,
+        source: str = "bet-slip",
+        user_id: int | None = None,
+    ) -> None:
+        prompt_tokens = int(prompt_tokens or 0)
+        completion_tokens = int(completion_tokens or 0)
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
+        await self._conn.execute(
+            """
+            INSERT INTO openai_usage
+                (created_at, model, prompt_tokens, completion_tokens, total_tokens, source, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.datetime.utcnow().isoformat(),
+                model,
+                prompt_tokens,
+                completion_tokens,
+                int(total_tokens or 0),
+                source,
+                user_id,
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_openai_usage_summary(self) -> dict[str, Any]:
+        """Return today / month / all-time token totals (UTC)."""
+        now = datetime.datetime.utcnow()
+        today_prefix = now.strftime("%Y-%m-%d")
+        month_prefix = now.strftime("%Y-%m")
+
+        async def _agg(where: str, arg: str | None = None) -> dict[str, Any]:
+            sql = (
+                "SELECT COUNT(*) AS calls, "
+                "COALESCE(SUM(prompt_tokens),0) AS prompt, "
+                "COALESCE(SUM(completion_tokens),0) AS completion, "
+                "COALESCE(SUM(total_tokens),0) AS total "
+                f"FROM openai_usage {where}"
+            )
+            cursor = await self._conn.execute(sql, (arg,) if arg is not None else ())
+            row = await cursor.fetchone()
+            return {
+                "calls": int(row["calls"] or 0),
+                "prompt": int(row["prompt"] or 0),
+                "completion": int(row["completion"] or 0),
+                "total": int(row["total"] or 0),
+            }
+
+        cursor = await self._conn.execute(
+            "SELECT model, COUNT(*) AS n FROM openai_usage "
+            "GROUP BY model ORDER BY n DESC LIMIT 5"
+        )
+        models = [dict(r) for r in await cursor.fetchall()]
+
+        return {
+            "today": await _agg("WHERE created_at LIKE ?", f"{today_prefix}%"),
+            "month": await _agg("WHERE created_at LIKE ?", f"{month_prefix}%"),
+            "all": await _agg(""),
+            "models": models,
+            "as_of": now.isoformat(timespec="seconds") + "Z",
+        }
+
     # ---------- monitored events (for auto-grading polling) ----------
 
     async def add_monitored_event(self, event: str, started_by: int) -> None:
@@ -658,6 +772,32 @@ class Database:
             (status, session_id),
         )
         await self._conn.commit()
+
+    async def set_collab_stake(
+        self, session_id: int, user_id: int, units: float, odds: Optional[int]
+    ) -> Optional[str]:
+        """Records one collab member's own units/odds independently --
+        host and partner each get their own pair, neither overwrites the
+        other's. Returns 'host' or 'partner' (whichever side was just
+        set), or None if user_id isn't part of this session at all."""
+        session = await self.get_collab_session(session_id)
+        if session is None:
+            return None
+        if user_id == session["host_user_id"]:
+            await self._conn.execute(
+                "UPDATE collab_sessions SET host_units = ?, host_odds = ? WHERE id = ?",
+                (units, odds, session_id),
+            )
+            await self._conn.commit()
+            return "host"
+        if user_id == session.get("partner_user_id"):
+            await self._conn.execute(
+                "UPDATE collab_sessions SET partner_units = ?, partner_odds = ? WHERE id = ?",
+                (units, odds, session_id),
+            )
+            await self._conn.commit()
+            return "partner"
+        return None
 
     async def add_collab_leg(
         self,

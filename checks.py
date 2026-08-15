@@ -50,6 +50,13 @@ def resolve_allowed_target(
     return user.id, user
 
 
+def other_allowed_user_id(user_id: int) -> Optional[int]:
+    """Given one allowed user's ID, returns the other one -- used to
+    resolve a collab bet's partner (e.g. for the '/card' Collab section
+    header) without hardcoding either user's ID directly."""
+    return next((uid for uid in config.ALLOWED_USER_IDS if uid != user_id), None)
+
+
 def target_user_id_from_namespace(interaction: discord.Interaction) -> int:
     """For event autocomplete when a `user` option may already be filled."""
     try:

@@ -1,16 +1,21 @@
 """
 OCR a bookmaker slip screenshot and turn it into structured bet legs.
 
-Image OCR uses RapidOCR only (local ONNX). Paste slip text to skip OCR.
+Image path prefers OpenAI Vision when OPENAI_API_KEY is set, then falls
+back to RapidOCR (local ONNX). Paste slip text to skip image OCR.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
+import json
 import logging
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
+
+import aiohttp
 
 from leg_parser import parse_leg_line
 from odds_math import american_to_decimal, combine_parlay, decimal_to_american
@@ -110,6 +115,53 @@ _ET_TIME_RE = re.compile(
 
 _rapid_engine = None
 
+_VISION_SYSTEM = (
+    "You read sportsbook bet-slip screenshots (FanDuel, DraftKings, etc.). "
+    "Return ONLY valid JSON (no markdown). Extract every betting selection "
+    "leg accurately. Ignore UI chrome (Clear All, Cash Out, Balance, "
+    "wager boxes, boosts, X remove icons)."
+)
+
+_VISION_USER = """Extract this UFC/MMA bet slip into JSON with this shape:
+{
+  "event": "event name if visible else null",
+  "book": "FanDuel|DraftKings|BetMGM|other|null",
+  "combined_american": null,
+  "combined_decimal": 45.77,
+  "legs": [
+    {
+      "description": "Ian Machado Garry +5.5",
+      "fighter_pick": "Ian Machado Garry",
+      "market": "Fight Spread",
+      "line": 5.5,
+      "american_odds": null,
+      "decimal_odds": 1.95,
+      "fighter_a": "Islam Makhachev",
+      "fighter_b": "Ian Machado Garry"
+    }
+  ],
+  "raw_text": "line-by-line transcription of each selection + market + matchup + odds"
+}
+
+Critical rules:
+1. The PICK is the highlighted/selected name (often green or bold) — NOT the opponent.
+   Example: selection "Kaue Fernandes" under "To Win Fight" with matchup
+   "Jalin Turner vs Kaue Fernandes" → fighter_pick = "Kaue Fernandes" (not Turner).
+2. Fight Spread: include the handicap in description, e.g. "Ian Machado Garry +5.5".
+   Set market="Fight Spread" and line to the number (5.5 or -5.5).
+3. Method markets: keep full text
+   ("by KO, TKO, DQ or Submission", "by KO, TKO or DQ").
+4. To Win Fight / Moneyline: description like "Kaue Fernandes to win";
+   fighter_pick must be the selected fighter only.
+5. Odds: use the number printed on that leg (FanDuel is usually DECIMAL like 1.95).
+   Set decimal_odds when the slip shows decimals; leave american_odds null unless
+   American odds (+/-) are printed.
+6. combined_decimal / combined_american: use the PARLAY TOTAL printed on the slip
+   (e.g. "6 Fold" then 45.77). Do NOT invent a total. Prefer the large combined
+   decimal when shown.
+7. One object per selection only — never turn matchup-only lines into legs.
+"""
+
 
 def _get_rapid_ocr():
     global _rapid_engine
@@ -123,17 +175,363 @@ def _get_rapid_ocr():
     return _rapid_engine
 
 
+def _image_data_url(image: bytes, filename: str = "slip.png") -> str:
+    lower = (filename or "").lower()
+    if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+        mime = "image/jpeg"
+    elif lower.endswith(".webp"):
+        mime = "image/webp"
+    else:
+        mime = "image/png"
+    b64 = base64.b64encode(image).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def _openai_credentials() -> tuple[str, str]:
+    try:
+        import config
+
+        key = (getattr(config, "OPENAI_API_KEY", None) or "").strip()
+        model = (getattr(config, "OPENAI_VISION_MODEL", None) or "gpt-4o-mini").strip()
+    except Exception:
+        import os
+
+        key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        model = (os.getenv("OPENAI_VISION_MODEL") or "gpt-4o-mini").strip()
+    return key, model or "gpt-4o-mini"
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        raise RuntimeError("Vision response was not JSON")
+    data = json.loads(m.group(0))
+    if not isinstance(data, dict):
+        raise RuntimeError("Vision JSON root must be an object")
+    return data
+
+
+async def _vision_parse_slip(
+    image: bytes,
+    *,
+    filename: str = "slip.png",
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+) -> dict[str, Any]:
+    key, default_model = _openai_credentials()
+    key = (api_key or key).strip()
+    model = (model or default_model).strip() or "gpt-4o-mini"
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": _VISION_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _VISION_USER},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _image_data_url(image, filename),
+                            "detail": "high",
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=90)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        ) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"OpenAI Vision HTTP {resp.status}: {body[:300]}")
+            data = json.loads(body)
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"Unexpected OpenAI response: {e}") from e
+
+    parsed = _extract_json_object(content)
+    usage = data.get("usage") or {}
+    parsed["_usage"] = {
+        "model": data.get("model") or model,
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage.get("completion_tokens") or 0),
+        "total_tokens": int(
+            usage.get("total_tokens")
+            or (
+                int(usage.get("prompt_tokens") or 0)
+                + int(usage.get("completion_tokens") or 0)
+            )
+        ),
+    }
+    log.info(
+        "OCR via OpenAI Vision model=%s legs=%s tokens=%s",
+        model,
+        len(parsed.get("legs") or []),
+        parsed["_usage"]["total_tokens"],
+    )
+    return parsed
+
+
+def _vision_payload_to_slip(payload: dict[str, Any]) -> dict[str, Any]:
+    """Map Vision JSON into the same shape as parse_bookmaker_slip()."""
+    notes: list[str] = ["Parsed with OpenAI Vision"]
+    raw_text = str(payload.get("raw_text") or "").strip()
+    event = payload.get("event")
+    if event:
+        notes.append(f"Vision event: {event}")
+    book = payload.get("book")
+    if book:
+        notes.append(f"Vision book: {book}")
+
+    legs: list[dict[str, Any]] = []
+    leg_decimals: list[float] = []
+    leg_americans: list[int] = []
+
+    def _record_leg_odds(description: str, item: dict[str, Any]) -> None:
+        am = item.get("american_odds")
+        dec = item.get("decimal_odds")
+        try:
+            if dec is not None and float(dec) > 1:
+                d = float(dec)
+                leg_decimals.append(d)
+                notes.append(f"Leg decimal {d:g}: {description}")
+                leg_americans.append(decimal_to_american(Decimal(str(d))))
+                return
+        except (TypeError, ValueError, InvalidOperation):
+            pass
+        try:
+            if am is not None and str(am).strip() != "":
+                am_i = int(am)
+                leg_americans.append(am_i)
+                notes.append(f"Leg american {am_i:+d}: {description}")
+        except (TypeError, ValueError):
+            pass
+
+    for item in payload.get("legs") or []:
+        if not isinstance(item, dict):
+            continue
+        description = (
+            item.get("description")
+            or item.get("selection")
+            or item.get("label")
+            or ""
+        ).strip()
+        if not description:
+            continue
+        market_name = (item.get("market") or item.get("market_name") or "").strip() or None
+        fighter_a = (item.get("fighter_a") or "").strip() or None
+        fighter_b = (item.get("fighter_b") or "").strip() or None
+        fighter_pick = (item.get("fighter_pick") or "").strip() or None
+        line_val = item.get("line")
+
+        is_spread = bool(
+            (market_name and re.search(r"spread|handicap", market_name, re.I))
+            or (
+                re.search(r"[+-]\d+(?:\.\d+)?", description)
+                and re.search(r"spread|handicap", description, re.I)
+            )
+        )
+        if is_spread or (
+            line_val is not None
+            and market_name
+            and re.search(r"spread|handicap", market_name, re.I)
+        ):
+            try:
+                line_f = float(line_val) if line_val is not None else None
+            except (TypeError, ValueError):
+                line_f = None
+            if line_f is None:
+                m_line = re.search(r"([+-]\d+(?:\.\d+)?)", description)
+                if m_line:
+                    try:
+                        line_f = float(m_line.group(1))
+                    except ValueError:
+                        line_f = None
+            pick = fighter_pick or description
+            pick = re.sub(r"\s*[+-]\d+(?:\.\d+)?\s*$", "", pick).strip() or pick
+            pick = re.sub(r"\s+vs\.?\s+.*$", "", pick, flags=re.I).strip() or pick
+            if line_f is not None:
+                sign = "+" if line_f > 0 else ""
+                description = f"{pick} {sign}{line_f:g}"
+                ot = "SPREAD_" + str(line_f).replace(".", "_").replace("-", "m")
+            else:
+                description = pick
+                ot = "SPREAD"
+            legs.append(
+                {
+                    "description": description,
+                    "fighter_pick": pick,
+                    "outcome_type": ot,
+                    "outcome_round": None,
+                    "selection_raw": description,
+                    "fighter_a": fighter_a,
+                    "fighter_b": fighter_b,
+                    "market_name": market_name or "Fight Spread",
+                    "spread_line": line_f,
+                }
+            )
+            _record_leg_odds(description, item)
+            continue
+
+        # Moneyline / to win — trust fighter_pick (green selection), not opponent
+        if market_name and re.search(r"money\s*line|to\s+win", market_name, re.I):
+            base = fighter_pick or description
+            base = re.sub(r"\s+to\s+win\b.*$", "", base, flags=re.I).strip() or base
+            base = re.sub(r"\s+vs\.?\s+.*$", "", base, flags=re.I).strip() or base
+            if fighter_pick:
+                base = fighter_pick
+            description = (
+                base
+                if re.search(r"\b(to win|ml)\b", base, re.I)
+                else f"{base} to win"
+            )
+
+        leg = _selection_to_leg(
+            description,
+            fighter_a=fighter_a,
+            fighter_b=fighter_b,
+            market_name=market_name,
+        )
+        if not leg:
+            leg = {
+                "description": description,
+                "fighter_pick": fighter_pick,
+                "outcome_type": None,
+                "outcome_round": None,
+                "selection_raw": description,
+                "fighter_a": fighter_a,
+                "fighter_b": fighter_b,
+                "market_name": market_name,
+            }
+        if fighter_pick:
+            leg["fighter_pick"] = fighter_pick
+            desc = leg.get("description") or description
+            if fighter_pick.lower() not in desc.lower():
+                m = re.search(r"\b(by\s+.+|to\s+win.*)$", desc, re.I)
+                leg["description"] = (
+                    f"{fighter_pick} {m.group(1)}" if m else f"{fighter_pick} to win"
+                )
+        legs.append(leg)
+        _record_leg_odds(leg.get("description") or description, item)
+
+    combined_american: Optional[int] = None
+    combined_decimal: Optional[float] = None
+    # Prefer printed decimal parlay total (FanDuel "6 Fold 45.77")
+    for key in ("combined_decimal", "parlay_decimal"):
+        val = payload.get(key)
+        try:
+            if val is not None and float(val) > 1:
+                combined_decimal = float(val)
+                combined_american = decimal_to_american(Decimal(str(combined_decimal)))
+                notes.append(f"Parlay decimal from vision: {combined_decimal:g}")
+                break
+        except (TypeError, ValueError, InvalidOperation):
+            continue
+    if combined_american is None:
+        for key in ("combined_american", "parlay_american", "odds"):
+            val = payload.get(key)
+            if val is None or str(val).strip() == "":
+                continue
+            try:
+                combined_american = int(val)
+                combined_decimal = float(american_to_decimal(combined_american))
+                notes.append(f"Parlay total from vision: {combined_american:+d}")
+                break
+            except (TypeError, ValueError, Exception):
+                continue
+
+    if combined_american is None and len(leg_decimals) >= 2:
+        prod = Decimal("1")
+        for d in leg_decimals:
+            prod *= Decimal(str(d))
+        combined_decimal = float(prod)
+        try:
+            combined_american = decimal_to_american(prod)
+        except (InvalidOperation, ValueError):
+            pass
+        notes.append(
+            f"Combined {len(leg_decimals)} leg decimals -> {combined_decimal:g}"
+        )
+    elif combined_american is None and len(leg_americans) >= 2:
+        try:
+            combo = combine_parlay(leg_americans)
+            combined_american = combo["combined_american"]
+            combined_decimal = combo["combined_decimal"]
+            notes.append(
+                f"Combined {len(leg_americans)} leg americans -> {combined_american:+d}"
+            )
+        except Exception:
+            pass
+
+    if not raw_text and legs:
+        raw_text = "\n".join(L.get("description") or "" for L in legs)
+
+    return {
+        "legs": legs,
+        "odds": combined_american,
+        "decimal_odds": combined_decimal,
+        "notes": notes,
+        "raw_text": raw_text,
+        "event_hint": event,
+        "source": "openai_vision",
+    }
+
+
 async def ocr_image_bytes(
     image: bytes,
     *,
     filename: str = "slip.png",
     api_key: Optional[str] = None,
 ) -> str:
-    """Return OCR text via RapidOCR only."""
-    del filename, api_key
+    """Return OCR / transcription text (Vision preferred, RapidOCR fallback)."""
+    key, _model = _openai_credentials()
+    key = (api_key or key).strip()
+    if key:
+        try:
+            vision = await _vision_parse_slip(image, filename=filename, api_key=key)
+            text = str(vision.get("raw_text") or "").strip()
+            if not text:
+                # reconstruct from legs
+                text = "\n".join(
+                    str(x.get("description") or "").strip()
+                    for x in (vision.get("legs") or [])
+                    if isinstance(x, dict) and x.get("description")
+                )
+            if text:
+                return text
+        except Exception as e:
+            log.warning("OpenAI Vision OCR failed, falling back to RapidOCR: %s", e)
+
     text = await asyncio.to_thread(_ocr_rapid_sync, image)
     if not text or len(text.strip()) < 8:
-        raise RuntimeError("RapidOCR returned no usable text — try a clearer screenshot.")
+        raise RuntimeError("OCR returned no usable text — try a clearer screenshot.")
     log.info("OCR via RapidOCR (%d chars)", len(text))
     return text.strip()
 
@@ -593,13 +991,40 @@ def _selection_to_leg(
 
 
 async def image_to_slip(image: bytes, *, filename: str = "slip.png") -> dict[str, Any]:
+    """
+    Parse a slip screenshot into legs.
+
+    Prefers OpenAI Vision structured JSON when OPENAI_API_KEY is set.
+    Falls back to RapidOCR + local line parser. After confirm, bets still
+    grade through the existing ESPN auto-grader like any other logged slip.
+    """
+    key, _model = _openai_credentials()
+    if key:
+        try:
+            vision = await _vision_parse_slip(image, filename=filename, api_key=key)
+            result = _vision_payload_to_slip(vision)
+            usage = vision.get("_usage") if isinstance(vision, dict) else None
+            if usage:
+                result["openai_usage"] = usage
+            if result.get("legs"):
+                result["ocr_text"] = result.get("raw_text") or ""
+                return result
+            log.warning("Vision returned no legs — falling back to RapidOCR")
+        except Exception as e:
+            log.warning("OpenAI Vision slip parse failed: %s", e)
+
     text = await ocr_image_bytes(image, filename=filename)
+    # If Vision key exists but structured path failed, ocr_image_bytes may
+    # already have used Vision for raw_text — parse locally either way.
     result = parse_bookmaker_slip(text)
     result["ocr_text"] = text
+    if not result.get("source"):
+        result["source"] = "rapidocr" if not key else "openai_vision_text+local"
     return result
 
 
 def text_to_slip(text: str) -> dict[str, Any]:
     result = parse_bookmaker_slip(text)
     result["ocr_text"] = text
+    result["source"] = "text"
     return result

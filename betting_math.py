@@ -23,6 +23,26 @@ CURRENCY_SYMBOLS = config.CURRENCY_SYMBOLS
 SUPPORTED_CURRENCIES = ("GBP", "EUR", "USD")
 
 
+def personalize_collab_bet(bet: dict, viewer_id: int) -> dict:
+    """A collab bet is one DB row shared by two people (host = user_id,
+    partner = co_user_id), each with their own stake -- the host's own
+    units/odds live in the normal `units`/`odds` columns, the partner's
+    in `partner_units`/`partner_odds`. Every consumer (embeds, /card,
+    /pl, /results, notifications, spreadsheets) should call this right
+    after fetching a bet so it always shows the VIEWER's own numbers,
+    not necessarily the host's -- returns a shallow copy with units/odds
+    swapped in for the partner's case; the host's case and any
+    non-collab bet are returned completely unchanged (no copy needed)."""
+    if not bet.get("is_collab") or viewer_id != bet.get("co_user_id"):
+        return bet
+    out = dict(bet)
+    if bet.get("partner_units") is not None:
+        out["units"] = bet["partner_units"]
+    if bet.get("partner_odds") is not None:
+        out["odds"] = bet["partner_odds"]
+    return out
+
+
 def get_currency_for_user(user_id: int) -> str:
     """Config fallback when the user hasn't saved a currency in the DB yet."""
     return config.USER_CURRENCY.get(user_id, "GBP")

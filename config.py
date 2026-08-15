@@ -25,6 +25,18 @@ PANEL_API_URL = os.getenv("PANEL_API_URL", "https://panel.pebblehost.com").rstri
 PANEL_API_KEY = os.getenv("PANEL_API_KEY", "").strip()
 PANEL_SERVER_ID = os.getenv("PANEL_SERVER_ID", "").strip()
 
+# OpenAI Vision for /bet-slip screenshots (optional — falls back to RapidOCR)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", OPENAI_VISION_MODEL).strip() or "gpt-4o-mini"
+OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1-mini").strip() or "gpt-image-1-mini"
+
+# Pikkit QuickPick — collab "Betslip Request" share links
+QUICKPICK_API_KEY = os.getenv("QUICKPICK_API_KEY", "").strip() or os.getenv("PIKKIT_API_KEY", "").strip()
+QUICKPICK_API_URL = os.getenv(
+    "QUICKPICK_API_URL", "https://externalapi.pikkit.com/v1/quickpick/create"
+).strip()
+
 # Only these Discord user IDs are allowed to use the bot's commands/buttons.
 # Each person's bets are fully isolated by their own user ID -- nobody sees
 # or can touch anyone else's bets, even though they share one bot/database.

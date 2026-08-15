@@ -274,6 +274,9 @@ class BetsCog(commands.Cog):
 
         unit_value, currency = await get_user_settings(db, owner_id)
         title = f"{event} · {owner.display_name}" if viewing_other else event
+        legs_by_bet_id = {
+            bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets
+        }
         embed = build_results_embed(
             title=title,
             bets=bets,
@@ -282,6 +285,7 @@ class BetsCog(commands.Cog):
             icon_url=owner.display_avatar.url,
             include_bet_list=True,
             event=event,
+            legs_by_bet_id=legs_by_bet_id,
         )
         await interaction.response.send_message(
             embed=embed,
@@ -365,6 +369,34 @@ class BetsCog(commands.Cog):
 
         unit_value, currency = await get_user_settings(db, owner_id)
 
+        avatar_bytes = None
+        try:
+            avatar_bytes = await owner.display_avatar.with_size(64).read()
+        except Exception:
+            avatar_bytes = None
+
+        collab_partner_names: dict[int, str] = {}
+        for bet in bets:
+            if not (bet.get("is_collab") or bet.get("co_user_id")):
+                continue
+            host = self.bot.get_user(bet["user_id"])
+            partner = self.bot.get_user(bet["co_user_id"]) if bet.get("co_user_id") else None
+            if host is None:
+                try:
+                    host = await self.bot.fetch_user(bet["user_id"])
+                except Exception:
+                    host = None
+            if partner is None and bet.get("co_user_id"):
+                try:
+                    partner = await self.bot.fetch_user(bet["co_user_id"])
+                except Exception:
+                    partner = None
+            h = host.display_name if host else str(bet["user_id"])
+            p = partner.display_name if partner else (
+                str(bet["co_user_id"]) if bet.get("co_user_id") else "?"
+            )
+            collab_partner_names[bet["id"]] = f"{h} + {p}"
+
         image_bytes = build_event_recap_image(
             event_name=event,
             event_date=event_date,
@@ -373,6 +405,9 @@ class BetsCog(commands.Cog):
             fights=fights,
             unit_value=unit_value,
             currency=currency,
+            username=owner.display_name,
+            avatar_bytes=avatar_bytes,
+            collab_partner_names=collab_partner_names,
         )
 
         safe_name = re.sub(r"[^\w\-]+", "_", event)[:60]
@@ -481,10 +516,24 @@ class BetsCog(commands.Cog):
                 return
 
         await interaction.response.defer(ephemeral=True)
+        db = self.bot.db  # type: ignore[attr-defined]
         try:
             if image is not None:
                 raw = await image.read()
                 parsed = await image_to_slip(raw, filename=image.filename or "slip.png")
+                usage = parsed.get("openai_usage")
+                if usage:
+                    try:
+                        await db.record_openai_usage(
+                            model=usage.get("model"),
+                            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                            completion_tokens=int(usage.get("completion_tokens") or 0),
+                            total_tokens=int(usage.get("total_tokens") or 0),
+                            source="bet-slip",
+                            user_id=interaction.user.id,
+                        )
+                    except Exception:
+                        pass
             else:
                 parsed = text_to_slip(text or "")
         except Exception as e:
@@ -512,8 +561,14 @@ class BetsCog(commands.Cog):
             if matched is not None:
                 event = matched.get("short_name") or matched.get("name") or event
         else:
+            # Prefer event guessed by Vision / OCR notes
+            hint = (parsed.get("event_hint") or "").strip()
             upcoming = self._upcoming_events()
-            if upcoming:
+            if hint and upcoming:
+                matched = card_data.match_event_in_list(hint, upcoming)
+                if matched is not None:
+                    event = matched.get("short_name") or matched.get("name") or hint
+            if not event and upcoming:
                 event = upcoming[0].get("short_name") or upcoming[0].get("name")
 
         match_notes: list[str] = []
@@ -521,6 +576,14 @@ class BetsCog(commands.Cog):
             legs, match_notes = await match_legs_to_card(legs, event=event)
         except Exception as e:
             match_notes = [f"Catalog match skipped: {e}"]
+
+        source = parsed.get("source") or "ocr"
+        source_label = {
+            "openai_vision": "OpenAI Vision",
+            "openai_vision_text+local": "OpenAI Vision + local parse",
+            "rapidocr": "RapidOCR",
+            "text": "pasted text",
+        }.get(str(source), str(source))
 
         odds = parsed.get("odds")
         dec = parsed.get("decimal_odds")
@@ -549,11 +612,12 @@ class BetsCog(commands.Cog):
 
         await interaction.followup.send(
             content=(
-                f"📷 **Parsed slip** ({len(legs)} leg(s))"
+                f"📷 **Parsed slip** ({len(legs)} leg(s)) · via **{source_label}**"
                 + (f" · event **{event}**" if event else " · _no event set_")
                 + f"\nOdds {odds_note} · units **{units:g}**\n\n{lines_txt}"
                 + note_txt
                 + "\n\n✓ = structured / catalog-matched. Confirm to log, or cancel."
+                + "\n_After logging, ESPN auto-grading settles the slip when fights finish._"
             ),
             view=ConfirmSlipImportView(
                 cog=self,

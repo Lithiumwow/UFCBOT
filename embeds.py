@@ -22,6 +22,7 @@ from betting_math import (
     format_native_with_usd,
 )
 from branding import apply_event_logo, brand_color, brand_label, event_brand
+from bet_types import categorize_bet, effective_legs
 
 
 STATUS_COLOR = {
@@ -54,31 +55,48 @@ LEG_EMOJI = {
 
 
 def _leg_lines(
-    bets: list[dict[str, Any]], unit_value: float, singular_label: str | None = None
+    bets: list[dict[str, Any]],
+    unit_value: float,
+    *,
+    singular_label: str | None = None,
+    legs_by_bet_id: dict[int, list[dict[str, Any]]] | None = None,
 ) -> list[str]:
     """
-    ML (1 leg): compact single line, as before.
-    Multi-leg bets (2 Legs / Parlays): numbered block with each leg on its
-    own line, so a 3-leg parlay doesn't run together as one wrapped line.
+    Straight / Prop: compact single line.
+    Parlay / Collab: numbered block with each leg on its own line.
     """
     lines = []
     counter = 0
+    legs_map = legs_by_bet_id or {}
     for b in bets:
-        legs = _get_legs(b)
+        structured = legs_map.get(b["id"])
+        if structured is not None:
+            legs = [
+                (leg.get("description") or "").strip()
+                for leg in effective_legs(b, structured)
+                if (leg.get("description") or "").strip()
+            ]
+        else:
+            legs = _get_legs(b)
         odds_str = format_odds(b.get("odds"))
         units = bet_stake_native(b, unit_value) / unit_value
         emoji = LEG_EMOJI.get(b.get("status"), "❔")
 
         if len(legs) > 1 and singular_label:
             counter += 1
-            prefix = "🤝 " if b.get("is_collab") else ""
+            prefix = "🤝 " if (b.get("is_collab") or b.get("co_user_id")) else ""
             leg_block = "\n".join(f"▸ {leg}" for leg in legs)
             lines.append(
-                f"**{prefix}{singular_label} {counter}**\n{leg_block}\n`{odds_str}`  ·  {units:g}u  {emoji}"
+                f"**{prefix}{singular_label} {counter}**\n{leg_block}\n"
+                f"`{odds_str}`  ·  {units:g}u  {emoji}"
             )
         else:
-            label = " + ".join(legs) if len(legs) > 1 else (legs[0] if legs else "Untitled bet")
-            if b.get("is_collab"):
+            label = (
+                " + ".join(legs)
+                if len(legs) > 1
+                else (legs[0] if legs else "Untitled bet")
+            )
+            if b.get("is_collab") or b.get("co_user_id"):
                 label = f"🤝 {label}"
             lines.append(f"▸ {label}  `{odds_str}`  ·  {units:g}u  {emoji}")
     return lines
@@ -107,14 +125,6 @@ def _get_legs(bet: dict[str, Any]) -> list[str]:
     return [leg.strip() for leg in raw.split("\n") if leg.strip()]
 
 
-def _leg_category(n: int) -> str:
-    if n <= 1:
-        return "ML"
-    if n == 2:
-        return "2 Legs"
-    return "Parlays"
-
-
 def _leg_category_singular(n: int) -> str:
     """For a single bet slip's own title (e.g. 'Parlay' not 'Parlays')."""
     if n == 2:
@@ -122,7 +132,29 @@ def _leg_category_singular(n: int) -> str:
     return "Parlay"
 
 
-CATEGORY_ORDER = ["ML", "2 Legs", "Parlays"]
+# Match /spread-sheet sections
+CARD_CATEGORY_ORDER = ["Straight Pick", "Prop", "Parlay", "Collab"]
+CARD_CATEGORY_HEADERS = {
+    "Straight Pick": "Straight Picks",
+    "Prop": "Prop Picks",
+    "Parlay": "Parlays",
+    "Collab": "Collab Slips",
+}
+CARD_CATEGORY_SINGULAR = {
+    "Straight Pick": None,
+    "Prop": None,
+    "Parlay": "Parlay",
+    "Collab": "Collab",
+}
+
+
+def _card_category(
+    bet: dict[str, Any],
+    legs: list[dict[str, Any]] | None = None,
+) -> str:
+    if bet.get("is_collab") or bet.get("co_user_id") is not None:
+        return "Collab"
+    return categorize_bet(bet, legs)
 
 
 def build_bet_embed(
@@ -307,6 +339,7 @@ def build_results_embed(
     include_monthly: bool = False,
     include_biggest_wins: bool = False,
     event: Optional[str] = None,
+    legs_by_bet_id: Optional[dict[int, list[dict[str, Any]]]] = None,
 ) -> discord.Embed:
     won = [b for b in bets if b["status"] == "won"]
     loss = [b for b in bets if b["status"] == "loss"]
@@ -379,12 +412,17 @@ def build_results_embed(
             ordered = ordered[-bet_list_limit:]
             list_title = f"Last {bet_list_limit} Plays"
 
-        grouped: dict[str, list[dict[str, Any]]] = {"ML": [], "2 Legs": [], "Parlays": []}
+        legs_map = legs_by_bet_id or {}
+        grouped: dict[str, list[dict[str, Any]]] = {
+            c: [] for c in CARD_CATEGORY_ORDER
+        }
         for b in ordered:
-            grouped[_leg_category(len(_get_legs(b)))].append(b)
+            cat = _card_category(b, legs_map.get(b["id"]))
+            if cat not in grouped:
+                cat = "Prop"
+            grouped[cat].append(b)
 
-        present_categories = [c for c in CATEGORY_ORDER if grouped[c]]
-        singular_labels = {"2 Legs": "2 Leg", "Parlays": "Parlay"}
+        present_categories = [c for c in CARD_CATEGORY_ORDER if grouped[c]]
         for idx, category in enumerate(present_categories):
             group_bets = grouped[category]
             if idx > 0:
@@ -392,14 +430,20 @@ def build_results_embed(
                 # clearly separate sections rather than one long list.
                 embed.add_field(name="\u200b", value="── ── ── ── ──", inline=False)
 
-            singular = singular_labels.get(category)
+            singular = CARD_CATEGORY_SINGULAR.get(category)
             # Multi-leg bets get a blank line between each numbered block so
-            # separate parlays don't run into each other; ML stays tightly packed.
+            # separate parlays don't run into each other; singles stay tight.
             sep = "\n\n" if singular else "\n"
             chunks = _chunk_lines(
-                _leg_lines(group_bets, unit_value, singular_label=singular), sep=sep
+                _leg_lines(
+                    group_bets,
+                    unit_value,
+                    singular_label=singular,
+                    legs_by_bet_id=legs_map,
+                ),
+                sep=sep,
             )
-            header = category
+            header = CARD_CATEGORY_HEADERS.get(category, category)
             for i, chunk in enumerate(chunks):
                 field_name = header if i == 0 else f"{header} (cont.)"
                 embed.add_field(name=field_name, value=chunk, inline=False)

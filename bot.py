@@ -60,6 +60,7 @@ class UFCBetBot(commands.Bot):
         await self.load_extension("cogs.grading")
         await self.load_extension("cogs.pl")
         await self.load_extension("cogs.admin")
+        await self.load_extension("cogs.tools")
 
         # Re-register a persistent BetView for every bet already stored, so
         # Won/Loss/Void/Delete buttons on old messages keep working after a
