@@ -746,21 +746,30 @@ def build_pl_embed(
     return embed
 
 
-BETSLIP_FIELD_NAME = "🔗 Gambly"
+BETSLIP_FIELD_NAME = "🔗 Betslip"
+_BETSLIP_DESC_MARK = "**Betslip**"
 
 
 def with_betslip_links(embed: discord.Embed, links: list[str]) -> discord.Embed:
-    """Copy a /card embed and attach QuickPick share links (replaces any prior field)."""
+    """Copy a /card embed and attach betslip links without adding extra fields.
+
+    /card recaps already use many fields (Discord max 25). A new field is
+    often dropped, so the URL goes on the title + description instead.
+    """
     out = discord.Embed.from_dict(embed.to_dict())
-    kept = [f for f in out.fields if f.name != BETSLIP_FIELD_NAME]
-    out.clear_fields()
-    for field in kept:
-        out.add_field(name=field.name, value=field.value, inline=field.inline)
-    cleaned = [u.strip() for u in links if (u or "").strip()]
-    if cleaned:
-        out.add_field(
-            name=BETSLIP_FIELD_NAME,
-            value="\n".join(cleaned[:8])[:1024],
-            inline=False,
-        )
+    cleaned = [u.strip() for u in links if (u or "").strip().startswith("http")]
+    if not cleaned:
+        return out
+
+    # Title becomes clickable.
+    if not out.url:
+        out.url = cleaned[0]
+
+    desc = (out.description or "").strip()
+    # Drop a prior betslip block so re-runs don't stack.
+    if _BETSLIP_DESC_MARK in desc:
+        desc = desc.split(_BETSLIP_DESC_MARK, 1)[0].rstrip()
+    link_block = _BETSLIP_DESC_MARK + "\n" + "\n".join(cleaned[:5])
+    combined = f"{desc}\n\n{link_block}".strip() if desc else link_block
+    out.description = combined[:4096]
     return out

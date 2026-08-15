@@ -79,8 +79,15 @@ class QuickPickClient:
             log.error("QuickPick create error: %s", e)
             return {"status": "error", "message": str(e)}
 
-        request_id = (result or {}).get("request_id")
+        request_id = (
+            (result or {}).get("request_id")
+            or (result or {}).get("requestID")
+            or (result or {}).get("requestId")
+        )
         if not request_id:
+            # Create sometimes returns the finished payload instead of an id.
+            if extract_betslip_links(result if isinstance(result, dict) else None):
+                return result
             return {"status": "error", "message": f"No request_id: {result}"}
 
         time.sleep(2)
@@ -111,53 +118,69 @@ class QuickPickClient:
                 time.sleep(self.poll_interval)
                 continue
 
-            status = (data or {}).get("status", "unknown")
+            status = str((data or {}).get("status") or "unknown").strip().lower()
             log.info("QuickPick poll %s/%s status=%s", i + 1, self.max_polls, status)
-            if status == "complete":
+            if status in {"complete", "completed", "done", "success"}:
                 return data
-            if status in {"failed", "expired"}:
+            if status in {"failed", "expired", "error"}:
                 return data or {"status": status}
             time.sleep(self.poll_interval)
         return {"status": "timeout", "message": "QuickPick did not finish in time"}
 
 
+_LINK_KEYS = {
+    "link",
+    "betslip_link",
+    "betslip_url",
+    "betSlipUrl",
+    "url",
+    "shareUrl",
+    "share_url",
+    "deepLink",
+    "deeplink",
+    "deep_link",
+}
+
+
 def extract_betslip_links(payload: dict[str, Any] | None) -> list[str]:
     """Collect unique http(s) share / deep links from a QuickPick payload."""
-    if not payload:
+    if not payload or not isinstance(payload, dict):
         return []
     found: list[str] = []
 
     def _add(v: Any) -> None:
-        if isinstance(v, str) and v.startswith("http") and v not in found:
-            found.append(v)
+        if not isinstance(v, str):
+            return
+        s = v.strip()
+        if not s.startswith("http"):
+            return
+        low = s.lower()
+        if any(low.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".css", ".js", ".svg")):
+            return
+        if s not in found:
+            found.append(s)
 
-    for key in ("link", "betslip_link", "url", "shareUrl", "share_url", "deepLink", "deeplink"):
-        _add(payload.get(key))
+    def _walk(obj: Any, depth: int = 0) -> None:
+        if depth > 8 or obj is None:
+            return
+        if isinstance(obj, dict):
+            for key, val in obj.items():
+                kl = str(key).lower().replace("-", "_")
+                if kl in {k.lower() for k in _LINK_KEYS} or "url" in kl or "link" in kl:
+                    _add(val)
+                _walk(val, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item, depth + 1)
 
-    slips = payload.get("betSlips") or payload.get("bet_slips") or []
-    if isinstance(slips, list):
-        for slip in slips:
-            if not isinstance(slip, dict):
-                continue
-            for key in (
-                "shareUrl",
-                "share_url",
-                "deepLink",
-                "deeplink",
-                "url",
-                "link",
-                "betslip_link",
-            ):
-                _add(slip.get(key))
+    _walk(payload)
 
-    books = payload.get("books") or payload.get("sportsbooks") or []
-    if isinstance(books, list):
-        for book in books:
-            if isinstance(book, dict):
-                for key in ("link", "url", "deepLink", "deeplink", "shareUrl"):
-                    _add(book.get(key))
-
-    return found
+    preferred = [
+        u
+        for u in found
+        if any(tok in u.lower() for tok in ("pikkit", "quickpick", "gambly", "unabated", "betslip"))
+    ]
+    return preferred or found
 
 
 def format_card_bets_for_quickpick(
@@ -167,7 +190,7 @@ def format_card_bets_for_quickpick(
     event: Optional[str] = None,
     viewer_id: Optional[int] = None,
 ) -> str:
-    """Ticket text for every logged slip on a /card — same style Gambly/QuickPick parse."""
+    """Ticket text for every logged slip on a /card — the style QuickPick parses well."""
     from bet_types import effective_legs
     from betting_math import personalize_collab_bet
     from odds_math import format_american
@@ -234,5 +257,12 @@ async def request_betslip_links(text: str) -> tuple[list[str], dict[str, Any] | 
     if not client.configured:
         return [], {"status": "error", "message": "QUICKPICK_API_KEY is not set"}
     raw = await asyncio.to_thread(client.create_betslip, text)
-    links = extract_betslip_links(raw if isinstance(raw, dict) else None)
-    return links, raw if isinstance(raw, dict) else None
+    payload = raw if isinstance(raw, dict) else None
+    links = extract_betslip_links(payload)
+    if not links and payload:
+        log.warning(
+            "QuickPick finished with no parseable link. status=%s keys=%s",
+            payload.get("status"),
+            list(payload.keys()),
+        )
+    return links, payload

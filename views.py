@@ -12,6 +12,7 @@ Persistence works by:
 from __future__ import annotations
 
 import io
+import logging
 import re
 
 import discord
@@ -30,6 +31,8 @@ from embeds import (
 from spreadsheet_image import build_event_recap_image
 from leg_rematch import rematch_bets_to_card
 from quickpick import format_card_bets_for_quickpick, request_betslip_links
+
+log = logging.getLogger("ufc-bet-bot.views")
 
 
 async def resolve_display_names(
@@ -400,7 +403,7 @@ class BetView(discord.ui.View):
 
 
 class CardShareView(discord.ui.View):
-    """Share (and on /card, Gambly/QuickPick) buttons for ephemeral recap replies."""
+    """Share (and on /card, Betslip) buttons for ephemeral recap replies."""
 
     def __init__(
         self,
@@ -428,20 +431,20 @@ class CardShareView(discord.ui.View):
         self.add_item(self.share_btn)
 
         self.betslip_links: list[str] = []
-        self.gambly_btn: discord.ui.Button | None = None
+        self.betslip_btn: discord.ui.Button | None = None
         if kind == "card" and event:
-            self.gambly_btn = discord.ui.Button(
-                label="🔗 Gambly",
+            self.betslip_btn = discord.ui.Button(
+                label="🔗 Betslip",
                 style=discord.ButtonStyle.secondary,
             )
-            self.gambly_btn.callback = self._gambly_callback
-            self.add_item(self.gambly_btn)
+            self.betslip_btn.callback = self._betslip_callback
+            self.add_item(self.betslip_btn)
 
     def _set_generating(self, generating: bool) -> None:
         self.share_btn.disabled = generating
-        if self.gambly_btn is not None:
-            self.gambly_btn.disabled = generating
-            self.gambly_btn.label = "⏳ Generating…" if generating else "🔗 Gambly"
+        if self.betslip_btn is not None:
+            self.betslip_btn.disabled = generating
+            self.betslip_btn.label = "⏳ Generating…" if generating else "🔗 Betslip"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker_id:
@@ -477,7 +480,46 @@ class CardShareView(discord.ui.View):
             ephemeral=True,
         )
 
-    async def _gambly_callback(self, interaction: discord.Interaction):
+    def _apply_betslip_buttons(self, links: list[str]) -> None:
+        """Keep Share/Betslip, then add URL buttons Discord will always render."""
+        for child in list(self.children):
+            if isinstance(child, discord.ui.Button) and child.style == discord.ButtonStyle.link:
+                self.remove_item(child)
+        for i, url in enumerate(links[:3]):
+            if not (url or "").startswith("http"):
+                continue
+            label = "Open Betslip" if i == 0 else f"Betslip {i + 1}"
+            self.add_item(
+                discord.ui.Button(
+                    label=label[:80],
+                    style=discord.ButtonStyle.link,
+                    url=url,
+                )
+            )
+
+    async def _edit_card(
+        self,
+        interaction: discord.Interaction,
+        *,
+        embed: discord.Embed | None = None,
+        view: discord.ui.View | None = None,
+    ) -> None:
+        kwargs: dict = {}
+        if embed is not None:
+            kwargs["embed"] = embed
+        if view is not None:
+            kwargs["view"] = view
+        try:
+            await interaction.edit_original_response(**kwargs)
+            return
+        except discord.HTTPException:
+            pass
+        try:
+            await interaction.message.edit(**kwargs)
+        except discord.HTTPException as e:
+            log.warning("Could not edit /card message: %s", e)
+
+    async def _betslip_callback(self, interaction: discord.Interaction):
         if not (getattr(config, "QUICKPICK_API_KEY", "") or "").strip():
             await interaction.response.send_message(
                 "⚠️ `QUICKPICK_API_KEY` is not set in `.env`.",
@@ -493,55 +535,76 @@ class CardShareView(discord.ui.View):
         self._set_generating(True)
         await interaction.response.edit_message(view=self)
 
-        db = interaction.client.db  # type: ignore[attr-defined]
-        bets = await db.get_bets_for_event_matching(
-            self.event, self.sport, self.owner_user_id
-        )
-        if not bets:
+        try:
+            db = interaction.client.db  # type: ignore[attr-defined]
+            bets = await db.get_bets_for_event_matching(
+                self.event, self.sport, self.owner_user_id
+            )
+            if not bets:
+                self._set_generating(False)
+                await self._edit_card(interaction, view=self)
+                await interaction.followup.send(
+                    "No bets found on this card to send.", ephemeral=True
+                )
+                return
+
+            legs_by_bet_id = {
+                bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets
+            }
+            text = format_card_bets_for_quickpick(
+                bets,
+                legs_by_bet_id,
+                event=self.event,
+                viewer_id=self.owner_user_id,
+            )
+            if not text:
+                self._set_generating(False)
+                await self._edit_card(interaction, view=self)
+                await interaction.followup.send(
+                    "Couldn't build ticket text from this card.", ephemeral=True
+                )
+                return
+
+            links, raw = await request_betslip_links(text)
             self._set_generating(False)
-            await interaction.message.edit(view=self)
-            await interaction.followup.send(
-                "No bets found on this card to send.", ephemeral=True
-            )
-            return
+            if not links:
+                await self._edit_card(interaction, view=self)
+                msg = (raw or {}).get("message") or (raw or {}).get("status") or "no links"
+                await interaction.followup.send(
+                    f"❌ QuickPick did not return a link (`{msg}`).",
+                    ephemeral=True,
+                )
+                return
 
-        legs_by_bet_id = {bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets}
-        text = format_card_bets_for_quickpick(
-            bets,
-            legs_by_bet_id,
-            event=self.event,
-            viewer_id=self.owner_user_id,
-        )
-        if not text:
+            self.betslip_links = links
+            original = None
+            try:
+                original = await interaction.original_response()
+            except discord.HTTPException:
+                original = interaction.message
+            embeds = list(original.embeds) if original else []
+            if not embeds:
+                self._apply_betslip_buttons(links)
+                await self._edit_card(interaction, view=self)
+                return
+
+            updated = with_betslip_links(embeds[0], links)
+            self._apply_betslip_buttons(links)
+            await self._edit_card(interaction, embed=updated, view=self)
+        except Exception:
+            log.exception("Betslip request failed")
             self._set_generating(False)
-            await interaction.message.edit(view=self)
-            await interaction.followup.send(
-                "Couldn't build ticket text from this card.", ephemeral=True
-            )
-            return
-
-        links, raw = await request_betslip_links(text)
-        self._set_generating(False)
-        if not links:
-            await interaction.message.edit(view=self)
-            msg = (raw or {}).get("message") or (raw or {}).get("status") or "no links"
-            await interaction.followup.send(
-                f"❌ QuickPick did not return a link (`{msg}`).",
-                ephemeral=True,
-            )
-            return
-
-        embeds = interaction.message.embeds
-        if not embeds:
-            await interaction.message.edit(view=self)
-            await interaction.followup.send(
-                "Card embed is missing; can't attach the link.", ephemeral=True
-            )
-            return
-
-        self.betslip_links = links
-        updated = with_betslip_links(embeds[0], links)
-        await interaction.message.edit(embed=updated, view=self)
+            try:
+                await self._edit_card(interaction, view=self)
+            except Exception:
+                pass
+            try:
+                await interaction.followup.send(
+                    "❌ Betslip request failed. Check bot logs.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
 
 
 class ToolShareView(discord.ui.View):
