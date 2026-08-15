@@ -19,6 +19,7 @@ from betting_math import (
     bet_profit_native,
     bet_stake_native,
     format_odds,
+    format_odds_with_alt,
     format_native_with_usd,
 )
 from branding import apply_event_logo, brand_color, brand_label, event_brand
@@ -54,37 +55,93 @@ LEG_EMOJI = {
 }
 
 
+def _collab_member_ids(bet: dict[str, Any], structured: list[dict[str, Any]] | None) -> list[int]:
+    """Host, partner, then anyone else who added a leg — unique, in order."""
+    ids: list[int] = []
+    for uid in (bet.get("user_id"), bet.get("co_user_id")):
+        if uid and uid not in ids:
+            ids.append(uid)
+    for leg in structured or []:
+        uid = leg.get("added_by")
+        if uid and uid not in ids:
+            ids.append(uid)
+    return ids
+
+
+def collect_card_user_ids(
+    bets: list[dict[str, Any]],
+    legs_by_bet_id: dict[int, list[dict[str, Any]]] | None = None,
+) -> set[int]:
+    """User ids needed to label collab members / per-play authors on /card."""
+    ids: set[int] = set()
+    legs_map = legs_by_bet_id or {}
+    for b in bets:
+        if b.get("user_id"):
+            ids.add(b["user_id"])
+        if b.get("co_user_id"):
+            ids.add(b["co_user_id"])
+        for leg in legs_map.get(b["id"], []):
+            if leg.get("added_by"):
+                ids.add(leg["added_by"])
+    return ids
+
+
 def _leg_lines(
     bets: list[dict[str, Any]],
     unit_value: float,
     *,
     singular_label: str | None = None,
     legs_by_bet_id: dict[int, list[dict[str, Any]]] | None = None,
+    member_names: dict[int, str] | None = None,
 ) -> list[str]:
     """
     Straight / Prop: compact single line.
     Parlay / Collab: numbered block with each leg on its own line.
+    Collab headers list members (Collab 1 Miller/Lithiumwow) and each play
+    is tagged with who picked it.
     """
     lines = []
     counter = 0
     legs_map = legs_by_bet_id or {}
+    names = member_names or {}
     for b in bets:
         structured = legs_map.get(b["id"])
         if structured is not None:
-            legs = [
-                (leg.get("description") or "").strip()
-                for leg in effective_legs(b, structured)
+            structured_legs = [
+                leg for leg in effective_legs(b, structured)
                 if (leg.get("description") or "").strip()
             ]
+            legs = [(leg.get("description") or "").strip() for leg in structured_legs]
         else:
+            structured_legs = None
             legs = _get_legs(b)
-        odds_str = format_odds(b.get("odds"))
+        # Recaps (/card, /results) always show American odds, even if the
+        # user entered decimal on the slip itself.
+        odds_str = format_odds(b.get("odds"), "american")
         units = bet_stake_native(b, unit_value) / unit_value
         emoji = LEG_EMOJI.get(b.get("status"), "❔")
+        is_collab = bool(b.get("is_collab") or b.get("co_user_id"))
 
-        if len(legs) > 1 and singular_label:
+        if is_collab and singular_label:
             counter += 1
-            prefix = "🤝 " if (b.get("is_collab") or b.get("co_user_id")) else ""
+            member_ids = _collab_member_ids(b, structured_legs)
+            name_bit = "/".join(names[uid] for uid in member_ids if uid in names)
+            header = f"**Collab {counter}**" if not name_bit else f"**Collab {counter} {name_bit}**"
+            play_lines = []
+            rows = structured_legs if structured_legs is not None else [
+                {"description": desc} for desc in legs
+            ]
+            for row in rows:
+                desc = (row.get("description") or "").strip()
+                if not desc:
+                    continue
+                who = names.get(row.get("added_by")) if row.get("added_by") else None
+                play_lines.append(f"▸ {desc} - {who}" if who else f"▸ {desc}")
+            block = "\n".join(play_lines) if play_lines else "_No plays_"
+            lines.append(f"{header}\n{block}\n`{odds_str}`  ·  {units:g}u  {emoji}")
+        elif len(legs) > 1 and singular_label:
+            counter += 1
+            prefix = "🤝 " if is_collab else ""
             leg_block = "\n".join(f"▸ {leg}" for leg in legs)
             lines.append(
                 f"**{prefix}{singular_label} {counter}**\n{leg_block}\n"
@@ -96,7 +153,7 @@ def _leg_lines(
                 if len(legs) > 1
                 else (legs[0] if legs else "Untitled bet")
             )
-            if b.get("is_collab") or b.get("co_user_id"):
+            if is_collab:
                 label = f"🤝 {label}"
             lines.append(f"▸ {label}  `{odds_str}`  ·  {units:g}u  {emoji}")
     return lines
@@ -157,6 +214,42 @@ def _card_category(
     return categorize_bet(bet, legs)
 
 
+def _stake_block(
+    *,
+    units: float,
+    odds: Optional[int],
+    unit_value: float,
+    currency: str,
+    odds_format: str | None,
+    bet: dict[str, Any],
+) -> tuple[str, str, str]:
+    """Returns (stake_text, odds_text, result_text) for one person's numbers."""
+    view = dict(bet)
+    view["units"] = units
+    view["odds"] = odds
+    stake_native = bet_stake_native(view, unit_value)
+    stake = (
+        f"**{units:g} u**\n{format_native_with_usd(stake_native, currency)}"
+    )
+    odds_text = f"**{format_odds_with_alt(odds, odds_format)}**"
+    status = (bet.get("status") or "pending").lower()
+    if status == "pending":
+        potential = bet_potential_win_native(view, unit_value)
+        result = (
+            f"**{potential / unit_value:+.2f} u**  ·  "
+            f"{format_native_with_usd(potential, currency, signed=True)}"
+        )
+    elif status in ("won", "loss"):
+        profit = bet_profit_native(view, unit_value)
+        result = (
+            f"**{profit / unit_value:+.2f} u**  ·  "
+            f"{format_native_with_usd(profit, currency, signed=True)}"
+        )
+    else:
+        result = "—"
+    return stake, odds_text, result
+
+
 def build_bet_embed(
     bet: dict[str, Any],
     *,
@@ -164,10 +257,11 @@ def build_bet_embed(
     currency: str,
     user: Optional[discord.abc.User] = None,
     co_user: Optional[discord.abc.User] = None,
+    co_unit_value: Optional[float] = None,
+    co_currency: Optional[str] = None,
 ) -> discord.Embed:
     status = bet.get("status", "pending")
     units = bet.get("units", 1.0)
-    stake_native = bet_stake_native(bet, unit_value)
     legs = _get_legs(bet)
 
     is_parlay = len(legs) > 1
@@ -207,30 +301,56 @@ def build_bet_embed(
         legs_value = "\n".join(f"**{i}.** {leg}" for i, leg in enumerate(legs, start=1))
         embed.add_field(name="🦵 Legs", value=legs_value, inline=False)
 
-    embed.add_field(
-        name="💰 Stake",
-        value=f"**{units:g} u**\n{format_native_with_usd(stake_native, currency)}",
-        inline=True,
+    host_stake, host_odds, host_result = _stake_block(
+        units=units,
+        odds=bet.get("odds"),
+        unit_value=unit_value,
+        currency=currency,
+        odds_format=bet.get("odds_format"),
+        bet=bet,
     )
-    embed.add_field(name="📈 Odds", value=f"**{format_odds(bet.get('odds'))}**", inline=True)
-    embed.add_field(name="📌 Status", value=f"**{STATUS_LABEL.get(status, status)}**", inline=True)
 
-    if status == "pending":
-        potential_native = bet_potential_win_native(bet, unit_value)
-        embed.add_field(
-            name="🎯 Potential Win",
-            value=f"**{potential_native / unit_value:+.2f} u**  ·  "
-            f"{format_native_with_usd(potential_native, currency, signed=True)}",
-            inline=False,
+    show_partner = (
+        co_user is not None
+        and (bet.get("is_collab") or bet.get("co_user_id") is not None)
+        and bet.get("partner_units") is not None
+    )
+    if show_partner:
+        host_name = user.display_name if user is not None else "Host"
+        partner_name = co_user.display_name
+        p_unit = co_unit_value if co_unit_value is not None else unit_value
+        p_cur = co_currency or currency
+        partner_stake, partner_odds, partner_result = _stake_block(
+            units=bet.get("partner_units") or 0,
+            odds=bet.get("partner_odds"),
+            unit_value=p_unit,
+            currency=p_cur,
+            odds_format=bet.get("partner_odds_format") or bet.get("odds_format"),
+            bet=bet,
         )
-    elif status in ("won", "loss"):
-        profit_native = bet_profit_native(bet, unit_value)
-        embed.add_field(
-            name="💵 Net Result",
-            value=f"**{profit_native / unit_value:+.2f} u**  ·  "
-            f"{format_native_with_usd(profit_native, currency, signed=True)}",
-            inline=False,
-        )
+        embed.add_field(name=f"💰 {host_name}", value=f"{host_stake}\n{host_odds}", inline=True)
+        embed.add_field(name=f"💰 {partner_name}", value=f"{partner_stake}\n{partner_odds}", inline=True)
+        embed.add_field(name="📌 Status", value=f"**{STATUS_LABEL.get(status, status)}**", inline=True)
+        if status == "pending":
+            embed.add_field(
+                name="🎯 Potential Win",
+                value=f"**{host_name}**  {host_result}\n**{partner_name}**  {partner_result}",
+                inline=False,
+            )
+        elif status in ("won", "loss"):
+            embed.add_field(
+                name="💵 Net Result",
+                value=f"**{host_name}**  {host_result}\n**{partner_name}**  {partner_result}",
+                inline=False,
+            )
+    else:
+        embed.add_field(name="💰 Stake", value=host_stake, inline=True)
+        embed.add_field(name="📈 Odds", value=host_odds, inline=True)
+        embed.add_field(name="📌 Status", value=f"**{STATUS_LABEL.get(status, status)}**", inline=True)
+        if status == "pending":
+            embed.add_field(name="🎯 Potential Win", value=host_result, inline=False)
+        elif status in ("won", "loss"):
+            embed.add_field(name="💵 Net Result", value=host_result, inline=False)
 
     return embed
 
@@ -315,7 +435,7 @@ def _biggest_wins_lines(
     for rank, b in enumerate(top, start=1):
         legs = _get_legs(b)
         label = " + ".join(legs) if len(legs) > 1 else (legs[0] if legs else "Untitled bet")
-        odds_str = format_odds(b.get("odds"))
+        odds_str = format_odds(b.get("odds"), "american")
         profit_native = bet_profit_native(b, unit_value)
         event = b.get("event")
         event_suffix = f"  ({event})" if event else ""
@@ -340,6 +460,7 @@ def build_results_embed(
     include_biggest_wins: bool = False,
     event: Optional[str] = None,
     legs_by_bet_id: Optional[dict[int, list[dict[str, Any]]]] = None,
+    member_names: Optional[dict[int, str]] = None,
 ) -> discord.Embed:
     won = [b for b in bets if b["status"] == "won"]
     loss = [b for b in bets if b["status"] == "loss"]
@@ -440,6 +561,7 @@ def build_results_embed(
                     unit_value,
                     singular_label=singular,
                     legs_by_bet_id=legs_map,
+                    member_names=member_names,
                 ),
                 sep=sep,
             )

@@ -18,6 +18,7 @@ Profit rules:
 from typing import Optional
 
 import config
+from odds_math import american_to_decimal, decimal_to_american
 
 CURRENCY_SYMBOLS = config.CURRENCY_SYMBOLS
 SUPPORTED_CURRENCIES = ("GBP", "EUR", "USD")
@@ -40,6 +41,8 @@ def personalize_collab_bet(bet: dict, viewer_id: int) -> dict:
         out["units"] = bet["partner_units"]
     if bet.get("partner_odds") is not None:
         out["odds"] = bet["partner_odds"]
+    if bet.get("partner_odds_format"):
+        out["odds_format"] = bet["partner_odds_format"]
     return out
 
 
@@ -151,7 +154,57 @@ def bet_potential_win_native(bet: dict, unit_value: float) -> float:
     )
 
 
-def format_odds(odds: Optional[int]) -> str:
+def normalize_odds_format(raw: str | None) -> str:
+    """`american` is default; `decimal` (and a few aliases) opt in."""
+    s = (raw or "american").strip().lower()
+    if s in ("decimal", "dec", "euro", "eu", "european"):
+        return "decimal"
+    return "american"
+
+
+def parse_stake_odds(
+    odds_raw: str | None,
+    *,
+    odds_format: str | None = None,
+) -> tuple[Optional[int], str]:
+    """Parse bet-size odds into stored American int + display format.
+
+    American is the default. A decimal point always means decimal odds.
+    With format=`decimal`, whole numbers like `2` are 2.00 decimal (+100),
+    not American +2.
+    """
+    fmt = normalize_odds_format(odds_format)
+    s = (odds_raw or "").strip().replace(",", "").replace(" ", "")
+    if not s:
+        return None, fmt
+    if "." in s:
+        fmt = "decimal"
+        return decimal_to_american(s), fmt
+    if fmt == "decimal":
+        return decimal_to_american(s), fmt
+    if s.startswith("+"):
+        s = s[1:]
+    american = int(s)
+    if american == 0:
+        raise ValueError("American odds cannot be 0")
+    return american, "american"
+
+
+def format_odds(odds: Optional[int], fmt: str | None = "american") -> str:
     if odds is None:
         return "N/A"
+    if normalize_odds_format(fmt) == "decimal":
+        try:
+            return f"{american_to_decimal(odds):.2f}"
+        except (ValueError, Exception):
+            pass
     return f"+{odds}" if odds > 0 else str(odds)
+
+
+def format_odds_with_alt(odds: Optional[int], fmt: str | None = "american") -> str:
+    """Primary format plus the other in parentheses, e.g. `+120 (2.20)`."""
+    if odds is None:
+        return "N/A"
+    primary = format_odds(odds, fmt)
+    other_fmt = "decimal" if normalize_odds_format(fmt) == "american" else "american"
+    return f"{primary} ({format_odds(odds, other_fmt)})"

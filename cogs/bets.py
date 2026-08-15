@@ -10,9 +10,9 @@ from discord.ext import commands
 import espn
 import card_data
 from bet_builder import BetBuilderSession, BuilderView
-from betting_math import CURRENCY_SYMBOLS, get_user_settings
-from embeds import build_bet_embed, build_results_embed
-from views import BetView, CardShareView, ConfirmDeleteEventView, ConfirmSlipImportView
+from betting_math import CURRENCY_SYMBOLS, get_user_settings, parse_stake_odds
+from embeds import build_bet_embed, build_results_embed, collect_card_user_ids
+from views import BetView, CardShareView, ConfirmDeleteEventView, ConfirmSlipImportView, resolve_display_names
 from checks import is_admin, resolve_allowed_target, target_user_id_from_namespace
 from spreadsheet_image import build_event_recap_image
 from leg_rematch import rematch_bets_to_card
@@ -73,6 +73,7 @@ class BetsCog(commands.Cog):
         legs: list[dict],
         units: float | None,
         odds: int | None,
+        odds_format: str = "american",
         use_followup: bool = False,
     ):
         """legs: list of {"description": str, "fighter_pick": str|None,
@@ -92,6 +93,7 @@ class BetsCog(commands.Cog):
             units=units if units is not None else 1.0,
             odds=odds,
             sport=sport,
+            odds_format=odds_format or "american",
         )
 
         for idx, leg in enumerate(legs):
@@ -277,6 +279,11 @@ class BetsCog(commands.Cog):
         legs_by_bet_id = {
             bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets
         }
+        names = await resolve_display_names(
+            self.bot,
+            collect_card_user_ids(bets, legs_by_bet_id),
+            guild=interaction.guild,
+        )
         embed = build_results_embed(
             title=title,
             bets=bets,
@@ -286,6 +293,7 @@ class BetsCog(commands.Cog):
             include_bet_list=True,
             event=event,
             legs_by_bet_id=legs_by_bet_id,
+            member_names=names,
         )
         await interaction.response.send_message(
             embed=embed,
@@ -444,7 +452,14 @@ class BetsCog(commands.Cog):
         leg_5="Fifth leg, if this is a parlay (optional)",
         leg_6="Sixth leg, if this is a parlay (optional)",
         units="How many units you're staking on the whole bet (e.g. 1.5). Defaults to 1.0",
-        odds="Combined American odds for the whole bet, e.g. -150 or +120 (optional)",
+        odds="Odds for the whole bet: American (-150, +120) or decimal (1.67)",
+        odds_format="American is default; choose decimal if you entered 1.67 / 2.20 style odds",
+    )
+    @app_commands.choices(
+        odds_format=[
+            app_commands.Choice(name="American (default)", value="american"),
+            app_commands.Choice(name="Decimal", value="decimal"),
+        ]
     )
     async def bet_nba(
         self,
@@ -457,7 +472,8 @@ class BetsCog(commands.Cog):
         leg_5: str | None = None,
         leg_6: str | None = None,
         units: app_commands.Range[float, 0.01, 1000.0] | None = 1.0,
-        odds: int | None = None,
+        odds: str | None = None,
+        odds_format: app_commands.Choice[str] | None = None,
     ):
         legs = []
         for text in (leg_1, leg_2, leg_3, leg_4, leg_5, leg_6):
@@ -466,13 +482,24 @@ class BetsCog(commands.Cog):
                     {"description": text.strip(), "fighter_pick": None, "outcome_type": None, "outcome_round": None}
                 )
 
+        fmt = odds_format.value if odds_format is not None else "american"
+        try:
+            parsed_odds, fmt = parse_stake_odds(odds, odds_format=fmt)
+        except (ValueError, Exception):
+            await interaction.response.send_message(
+                "⚠️ Odds must be American (`-150`, `+120`) or decimal (`1.67`).",
+                ephemeral=True,
+            )
+            return
+
         await self._log_bet(
             interaction,
             sport="nba",
             event=event,
             legs=legs,
             units=units,
-            odds=odds,
+            odds=parsed_odds,
+            odds_format=fmt,
         )
 
     # ---------- slip screenshot import ----------

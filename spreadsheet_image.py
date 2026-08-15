@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import chart
 from bet_types import categorize_legs, effective_legs
-from betting_math import bet_profit_native, bet_stake_native, format_native_with_usd
+from betting_math import bet_profit_native, bet_stake_native, format_native_with_usd, format_odds
 from card_data import match_fighter_on_card, resolve_fighter_on_card
 from grading import _name_matches
 
@@ -137,7 +137,7 @@ def _profit_color(amount: Optional[float], settled: bool) -> str:
 def _fmt_odds(odds: Optional[int]) -> str:
     if odds is None:
         return ""
-    return f"+{odds}" if odds > 0 else str(odds)
+    return format_odds(odds, "american")
 
 
 def _fmt_unit_bet(units: Optional[float]) -> str:

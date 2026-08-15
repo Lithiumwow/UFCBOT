@@ -18,10 +18,36 @@ import discord
 
 import card_data
 import chart
-from betting_math import get_user_settings, personalize_collab_bet
-from embeds import build_bet_embed, build_pl_embed, build_results_embed
+from betting_math import get_user_settings, parse_stake_odds, personalize_collab_bet, format_odds
+from embeds import build_bet_embed, build_pl_embed, build_results_embed, collect_card_user_ids
 from spreadsheet_image import build_event_recap_image
 from leg_rematch import rematch_bets_to_card
+
+
+async def resolve_display_names(
+    client: discord.Client,
+    user_ids: set[int] | list[int],
+    *,
+    guild: discord.Guild | None = None,
+) -> dict[int, str]:
+    """Map Discord user ids to display names for /card collab labels."""
+    names: dict[int, str] = {}
+    for uid in user_ids:
+        if not uid:
+            continue
+        member = guild.get_member(uid) if guild is not None else None
+        if member is not None:
+            names[uid] = member.display_name
+            continue
+        user = client.get_user(uid)
+        if user is None:
+            try:
+                user = await client.fetch_user(uid)
+            except (discord.NotFound, discord.HTTPException):
+                continue
+        if user is not None:
+            names[uid] = user.display_name
+    return names
 
 
 async def _build_slip_embed(client: discord.Client, bet: dict) -> discord.Embed:
@@ -64,6 +90,9 @@ async def _build_card_embed(
     legs_by_bet_id = {
         bet["id"]: await db.get_legs_for_bet(bet["id"]) for bet in bets
     }
+    names = await resolve_display_names(
+        client, collect_card_user_ids(bets, legs_by_bet_id)
+    )
     return build_results_embed(
         title=event,
         bets=bets,
@@ -73,6 +102,7 @@ async def _build_card_embed(
         include_bet_list=True,
         event=event,
         legs_by_bet_id=legs_by_bet_id,
+        member_names=names,
     )
 
 
@@ -1084,14 +1114,34 @@ class EditBetModal(discord.ui.Modal):
             required=True,
             max_length=10,
         )
-        self.odds_input = discord.ui.TextInput(
-            label="Odds (e.g. -150 or 120, blank = none)",
-            default=(str(display["odds"]) if display.get("odds") is not None else ""),
+        stored_fmt = (display.get("odds_format") or "american").lower()
+        if stored_fmt not in ("american", "decimal"):
+            stored_fmt = "american"
+        odds_default = ""
+        if display.get("odds") is not None:
+            odds_default = format_odds(display["odds"], stored_fmt)
+        self.odds_type_input = discord.ui.TextInput(
+            label="Odds type",
+            default=stored_fmt,
+            placeholder="american (default) or decimal",
             required=False,
-            max_length=10,
+            max_length=12,
+        )
+        self.odds_input = discord.ui.TextInput(
+            label="Odds",
+            default=odds_default,
+            placeholder="-150, +120, or 1.67",
+            required=False,
+            max_length=12,
         )
 
-        for item in (self.event_input, self.legs_input, self.units_input, self.odds_input):
+        for item in (
+            self.event_input,
+            self.legs_input,
+            self.units_input,
+            self.odds_type_input,
+            self.odds_input,
+        ):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -1103,16 +1153,17 @@ class EditBetModal(discord.ui.Modal):
             )
             return
 
-        odds_raw = self.odds_input.value.strip()
-        odds = None
-        if odds_raw:
-            try:
-                odds = int(odds_raw)
-            except ValueError:
-                await interaction.response.send_message(
-                    "⚠️ Odds must be a whole number, e.g. `-150` or `120`.", ephemeral=True
-                )
-                return
+        try:
+            odds, odds_format = parse_stake_odds(
+                self.odds_input.value, odds_format=self.odds_type_input.value
+            )
+        except (ValueError, Exception):
+            await interaction.response.send_message(
+                "⚠️ Odds must be American (`-150`, `+120`) or decimal (`1.67`). "
+                "Set Odds type to `american` or `decimal`.",
+                ephemeral=True,
+            )
+            return
 
         event = self.event_input.value.strip() or None
         bet_title = self.legs_input.value.strip() or None
@@ -1125,11 +1176,17 @@ class EditBetModal(discord.ui.Modal):
                 bet_title=bet_title,
                 partner_units=units,
                 partner_odds=odds,
+                partner_odds_format=odds_format,
                 edit_partner_side=True,
             )
         else:
             await db.update_bet_fields(
-                self.bet_id, event=event, bet_title=bet_title, units=units, odds=odds
+                self.bet_id,
+                event=event,
+                bet_title=bet_title,
+                units=units,
+                odds=odds,
+                odds_format=odds_format,
             )
         updated_bet = await db.get_bet(self.bet_id)
         if not updated_bet:

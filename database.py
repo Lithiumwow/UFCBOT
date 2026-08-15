@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS bets (
     co_user_id    INTEGER,
     is_collab     INTEGER NOT NULL DEFAULT 0,
     partner_units REAL,
-    partner_odds  INTEGER
+    partner_odds  INTEGER,
+    odds_format   TEXT NOT NULL DEFAULT 'american',
+    partner_odds_format TEXT
 );
 
 CREATE TABLE IF NOT EXISTS predictions (
@@ -90,7 +92,9 @@ CREATE TABLE IF NOT EXISTS collab_sessions (
     host_units      REAL,
     host_odds       INTEGER,
     partner_units   REAL,
-    partner_odds    INTEGER
+    partner_odds    INTEGER,
+    host_odds_format TEXT NOT NULL DEFAULT 'american',
+    partner_odds_format TEXT
 );
 
 CREATE TABLE IF NOT EXISTS collab_legs (
@@ -155,6 +159,10 @@ class Database:
             "ALTER TABLE collab_sessions ADD COLUMN host_odds INTEGER",
             "ALTER TABLE collab_sessions ADD COLUMN partner_units REAL",
             "ALTER TABLE collab_sessions ADD COLUMN partner_odds INTEGER",
+            "ALTER TABLE bets ADD COLUMN odds_format TEXT NOT NULL DEFAULT 'american'",
+            "ALTER TABLE bets ADD COLUMN partner_odds_format TEXT",
+            "ALTER TABLE collab_sessions ADD COLUMN host_odds_format TEXT NOT NULL DEFAULT 'american'",
+            "ALTER TABLE collab_sessions ADD COLUMN partner_odds_format TEXT",
         ):
             try:
                 await self._conn.execute(statement)
@@ -187,14 +195,17 @@ class Database:
         is_collab: bool = False,
         partner_units: Optional[float] = None,
         partner_odds: Optional[int] = None,
+        odds_format: str = "american",
+        partner_odds_format: Optional[str] = None,
     ) -> int:
         cursor = await self._conn.execute(
             """
             INSERT INTO bets (user_id, guild_id, channel_id, sport, event, bet_title,
                                units, odds, status, created_at, stake_gbp, returns_gbp,
                                fighter_pick, opponent_pick, outcome_type, outcome_round,
-                               co_user_id, is_collab, partner_units, partner_odds)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               co_user_id, is_collab, partner_units, partner_odds,
+                               odds_format, partner_odds_format)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -216,6 +227,8 @@ class Database:
                 1 if is_collab else 0,
                 partner_units,
                 partner_odds,
+                odds_format or "american",
+                partner_odds_format,
             ),
         )
         await self._conn.commit()
@@ -264,6 +277,8 @@ class Database:
         odds: Optional[int] = None,
         partner_units: Optional[float] = None,
         partner_odds: Optional[int] = None,
+        odds_format: Optional[str] = None,
+        partner_odds_format: Optional[str] = None,
         edit_partner_side: bool = False,
     ) -> None:
         """By default updates the bet's own event/title/units/odds (the
@@ -274,15 +289,15 @@ class Database:
         numbers with their own."""
         if edit_partner_side:
             await self._conn.execute(
-                "UPDATE bets SET event = ?, bet_title = ?, partner_units = ?, partner_odds = ? "
-                "WHERE id = ?",
-                (event, bet_title, partner_units, partner_odds, bet_id),
+                "UPDATE bets SET event = ?, bet_title = ?, partner_units = ?, partner_odds = ?, "
+                "partner_odds_format = ? WHERE id = ?",
+                (event, bet_title, partner_units, partner_odds, partner_odds_format, bet_id),
             )
         else:
             await self._conn.execute(
                 "UPDATE bets SET event = ?, bet_title = ?, units = ?, odds = ?, "
-                "stake_gbp = NULL, returns_gbp = NULL WHERE id = ?",
-                (event, bet_title, units, odds, bet_id),
+                "odds_format = ?, stake_gbp = NULL, returns_gbp = NULL WHERE id = ?",
+                (event, bet_title, units, odds, odds_format or "american", bet_id),
             )
         await self._conn.commit()
 
@@ -774,7 +789,12 @@ class Database:
         await self._conn.commit()
 
     async def set_collab_stake(
-        self, session_id: int, user_id: int, units: float, odds: Optional[int]
+        self,
+        session_id: int,
+        user_id: int,
+        units: float,
+        odds: Optional[int],
+        odds_format: str = "american",
     ) -> Optional[str]:
         """Records one collab member's own units/odds independently --
         host and partner each get their own pair, neither overwrites the
@@ -783,17 +803,20 @@ class Database:
         session = await self.get_collab_session(session_id)
         if session is None:
             return None
+        fmt = odds_format or "american"
         if user_id == session["host_user_id"]:
             await self._conn.execute(
-                "UPDATE collab_sessions SET host_units = ?, host_odds = ? WHERE id = ?",
-                (units, odds, session_id),
+                "UPDATE collab_sessions SET host_units = ?, host_odds = ?, host_odds_format = ? "
+                "WHERE id = ?",
+                (units, odds, fmt, session_id),
             )
             await self._conn.commit()
             return "host"
         if user_id == session.get("partner_user_id"):
             await self._conn.execute(
-                "UPDATE collab_sessions SET partner_units = ?, partner_odds = ? WHERE id = ?",
-                (units, odds, session_id),
+                "UPDATE collab_sessions SET partner_units = ?, partner_odds = ?, partner_odds_format = ? "
+                "WHERE id = ?",
+                (units, odds, fmt, session_id),
             )
             await self._conn.commit()
             return "partner"

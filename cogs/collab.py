@@ -20,7 +20,12 @@ from discord.ext import commands
 import card_data
 import config
 from bet_builder import BetBuilderSession, BuilderView
-from betting_math import get_user_settings, personalize_collab_bet
+from betting_math import (
+    format_odds_with_alt,
+    get_user_settings,
+    parse_stake_odds,
+    personalize_collab_bet,
+)
 from checks import is_admin
 from embeds import build_bet_embed
 from views import BetView, ShareDestinationView
@@ -63,10 +68,10 @@ async def _member_line(bot: commands.Bot, user_id: int) -> str:
     return f"{user.display_name} · @{user.name}"
 
 
-def _fmt_stake(units: Optional[float], odds: Optional[int]) -> str:
+def _fmt_stake(units: Optional[float], odds: Optional[int], fmt: str | None = "american") -> str:
     if units is None:
         return "⏳ not submitted yet"
-    odds_text = f"+{odds}" if (odds is not None and odds > 0) else (str(odds) if odds is not None else "no odds")
+    odds_text = format_odds_with_alt(odds, fmt) if odds is not None else "no odds"
     return f"✅ {units:g}u @ {odds_text}"
 
 
@@ -86,11 +91,11 @@ async def build_lobby_embed(
     )
 
     host_line = await _member_line(bot, session["host_user_id"])
-    host_line += f"\n{_fmt_stake(session.get('host_units'), session.get('host_odds'))}"
+    host_line += f"\n{_fmt_stake(session.get('host_units'), session.get('host_odds'), session.get('host_odds_format'))}"
     member_lines = [host_line]
     if partner_id:
         partner_line = await _member_line(bot, partner_id)
-        partner_line += f"\n{_fmt_stake(session.get('partner_units'), session.get('partner_odds'))}"
+        partner_line += f"\n{_fmt_stake(session.get('partner_units'), session.get('partner_odds'), session.get('partner_odds_format'))}"
         member_lines.append(partner_line)
     else:
         member_lines.append("_Waiting for partner_")
@@ -116,10 +121,21 @@ class FinalizeCollabModal(discord.ui.Modal, title="Set Your Stake"):
         self.units_input = discord.ui.TextInput(
             label="Units", default="1.0", required=True, max_length=10
         )
+        self.odds_type_input = discord.ui.TextInput(
+            label="Odds type",
+            default="american",
+            placeholder="american (default) or decimal",
+            required=False,
+            max_length=12,
+        )
         self.odds_input = discord.ui.TextInput(
-            label="Odds (American, e.g. -150 or 120)", required=False, max_length=10
+            label="Odds",
+            placeholder="-150, +120, or 1.67",
+            required=False,
+            max_length=12,
         )
         self.add_item(self.units_input)
+        self.add_item(self.odds_type_input)
         self.add_item(self.odds_input)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -131,19 +147,21 @@ class FinalizeCollabModal(discord.ui.Modal, title="Set Your Stake"):
             )
             return
 
-        odds_raw = (self.odds_input.value or "").strip()
-        odds = None
-        if odds_raw:
-            try:
-                odds = int(odds_raw)
-            except ValueError:
-                await interaction.response.send_message(
-                    "⚠️ Odds must be a whole number, e.g. `-150` or `120`.",
-                    ephemeral=True,
-                )
-                return
+        try:
+            odds, odds_format = parse_stake_odds(
+                self.odds_input.value, odds_format=self.odds_type_input.value
+            )
+        except (ValueError, Exception):
+            await interaction.response.send_message(
+                "⚠️ Odds must be American (`-150`, `+120`) or decimal (`1.67`). "
+                "Set Odds type to `american` or `decimal`.",
+                ephemeral=True,
+            )
+            return
 
-        await self.cog.submit_stake(interaction, self.session_id, units, odds)
+        await self.cog.submit_stake(
+            interaction, self.session_id, units, odds, odds_format=odds_format
+        )
 
 
 class CollabLobbyView(discord.ui.View):
@@ -453,10 +471,16 @@ class CollabCog(
         session_id: int,
         units: float,
         odds: Optional[int],
+        *,
+        odds_format: str = "american",
     ) -> None:
         """Records the caller's own units/odds independently. Once BOTH
         the host and partner have submitted their own stake, the bet
-        actually gets created -- not before."""
+        actually gets created -- not before.
+
+        The lobby message the Finalize button lived on is edited in place
+        so members see units/odds (and the finished slip) on the same embed.
+        """
         db = self.bot.db  # type: ignore[attr-defined]
         session = await db.get_collab_session(session_id)
         if not session or session["status"] != "open":
@@ -465,7 +489,9 @@ class CollabCog(
             )
             return
 
-        side = await db.set_collab_stake(session_id, interaction.user.id, units, odds)
+        side = await db.set_collab_stake(
+            session_id, interaction.user.id, units, odds, odds_format=odds_format
+        )
         if side is None:
             await interaction.response.send_message(
                 "You're not part of this collab.", ephemeral=True
@@ -482,26 +508,43 @@ class CollabCog(
                 session["partner_user_id"] if side == "host" else session["host_user_id"]
             )
             other_name = await _resolve_display(self.bot, other_id)
-            odds_text = (
-                f"+{odds}" if (odds is not None and odds > 0)
-                else (str(odds) if odds is not None else "no odds")
-            )
-            await interaction.response.send_message(
+            odds_text = format_odds_with_alt(odds, odds_format) if odds is not None else "no odds"
+            embed = await build_lobby_embed(self.bot, db, session)
+            try:
+                await interaction.response.edit_message(
+                    embed=embed, view=CollabLobbyView(self, session_id)
+                )
+            except (discord.HTTPException, discord.InteractionResponded):
+                await interaction.response.send_message(
+                    f"✅ Your stake is set: **{units:g}u @ {odds_text}**. Waiting on "
+                    f"**{other_name}** to set theirs too — the slip finalizes once both are in.",
+                    ephemeral=True,
+                )
+                await self.refresh_lobby_message(interaction.client, session_id)
+                return
+            await interaction.followup.send(
                 f"✅ Your stake is set: **{units:g}u @ {odds_text}**. Waiting on "
                 f"**{other_name}** to set theirs too — the slip finalizes once both are in.",
                 ephemeral=True,
             )
-            await self.refresh_lobby_message(interaction.client, session_id)
             return
 
-        await interaction.response.defer(ephemeral=True)
         await self._create_collab_bet(interaction, session)
+
+    def _register_bet_view(self, client, bet_id: int) -> None:
+        """Register a fresh persistent BetView for restarts. Never pass a View
+        that was already sent on a message — discord.py treats that instance
+        as non-persistent and raises ValueError."""
+        try:
+            client.add_view(BetView(bet_id))
+        except ValueError:
+            pass
 
     async def _create_collab_bet(self, interaction: discord.Interaction, session: dict) -> None:
         """Both members have now submitted their own stake -- create the
         one shared bet row (host's own stake in units/odds, partner's in
-        partner_units/partner_odds), post confirmations, and close out
-        the lobby message."""
+        partner_units/partner_odds) and replace the lobby embed with the
+        finished slip (same message, now with units + odds)."""
         db = self.bot.db  # type: ignore[attr-defined]
         session_id = session["id"]
         host_id = session["host_user_id"]
@@ -522,6 +565,8 @@ class CollabCog(
             is_collab=True,
             partner_units=session["partner_units"],
             partner_odds=session["partner_odds"],
+            odds_format=session.get("host_odds_format") or "american",
+            partner_odds_format=session.get("partner_odds_format") or "american",
         )
         for idx, leg in enumerate(collab_legs):
             await db.add_bet_leg(
@@ -542,54 +587,31 @@ class CollabCog(
         host_unit_value, host_currency = await get_user_settings(db, host_id)
         partner_unit_value, partner_currency = await get_user_settings(db, partner_id)
 
-        # Confirmation to whoever just completed the finalize (could be
-        # either side) -- personalized to just THEM (no co_user here, or
-        # it'd trigger the dual-stake display meant for the shared view).
-        viewer_bet = personalize_collab_bet(bet_row, interaction.user.id)
-        viewer_unit_value, viewer_currency = await get_user_settings(db, interaction.user.id)
-        embed = build_bet_embed(
-            viewer_bet, unit_value=viewer_unit_value, currency=viewer_currency, user=host,
-        )
-        view = BetView(bet_id)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-        interaction.client.add_view(view)  # type: ignore[attr-defined]
-
-        # Best-effort: also let the OTHER member know, with their own
-        # personalized numbers (also single-person, no dual-stake here).
-        other_id = partner_id if interaction.user.id == host_id else host_id
-        try:
-            other_user = self.bot.get_user(other_id) or await self._safe_fetch_user(other_id)
-            if other_user is not None:
-                other_bet = personalize_collab_bet(bet_row, other_id)
-                other_unit_value, other_currency = await get_user_settings(db, other_id)
-                other_embed = build_bet_embed(
-                    other_bet, unit_value=other_unit_value, currency=other_currency, user=host,
-                )
-                await other_user.send(
-                    content=f"🤝 Your collab slip (bet #{bet_id}) is finalized!",
-                    embed=other_embed,
-                )
-        except (discord.Forbidden, discord.HTTPException):
-            pass  # DMs closed or otherwise unreachable -- not fatal
-
-        # Public, permanent record with BOTH people's real numbers side by
-        # side -- a single Discord message can't show different things to
-        # different viewers, so this is the one place both stakes are
-        # visible together, using each person's own currency.
         canonical_embed = build_bet_embed(
-            bet_row, unit_value=host_unit_value, currency=host_currency, user=host, co_user=partner,
-            co_unit_value=partner_unit_value, co_currency=partner_currency,
+            bet_row,
+            unit_value=host_unit_value,
+            currency=host_currency,
+            user=host,
+            co_user=partner,
+            co_unit_value=partner_unit_value,
+            co_currency=partner_currency,
         )
-        public_channel = interaction.channel
-        canonical_message = None
-        try:
-            canonical_message = await public_channel.send(embed=canonical_embed, view=BetView(bet_id))
-            interaction.client.add_view(BetView(bet_id))  # type: ignore[attr-defined]
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-        await db.set_message_id(bet_id, canonical_message.id if canonical_message else None)
+        persist_view = BetView(bet_id)
+        self._register_bet_view(interaction.client, bet_id)
 
-        if session.get("message_id") and session.get("channel_id"):
+        lobby_id = session.get("message_id")
+        edited = False
+        try:
+            await interaction.response.edit_message(
+                content=None,
+                embed=canonical_embed,
+                view=persist_view,
+            )
+            edited = True
+        except (discord.HTTPException, discord.InteractionResponded):
+            edited = False
+
+        if not edited and lobby_id and session.get("channel_id"):
             channel = interaction.client.get_channel(session["channel_id"])
             if channel is None:
                 try:
@@ -598,17 +620,42 @@ class CollabCog(
                     channel = None
             if channel is not None:
                 try:
-                    lobby = await channel.fetch_message(session["message_id"])
-                    await lobby.edit(
-                        content=(
-                            f"✅ Collab `{session['code']}` finalized as bet **#{bet_id}** "
-                            f"· {_mention(host_id)} + {_mention(partner_id)}"
-                        ),
-                        embed=None,
-                        view=None,
-                    )
+                    lobby = await channel.fetch_message(lobby_id)
+                    await lobby.edit(content=None, embed=canonical_embed, view=BetView(bet_id))
+                    edited = True
                 except discord.HTTPException:
                     pass
+
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
+        await db.set_message_id(bet_id, lobby_id)
+
+        await interaction.followup.send(
+            f"✅ Collab `{session['code']}` finalized as bet **#{bet_id}** — "
+            "the lobby message is now the slip.",
+            ephemeral=True,
+        )
+
+        # Best-effort: also let the OTHER member know, with their own numbers.
+        other_id = partner_id if interaction.user.id == host_id else host_id
+        try:
+            other_user = self.bot.get_user(other_id) or await self._safe_fetch_user(other_id)
+            if other_user is not None:
+                other_bet = personalize_collab_bet(bet_row, other_id)
+                other_unit_value, other_currency = await get_user_settings(db, other_id)
+                other_embed = build_bet_embed(
+                    other_bet,
+                    unit_value=other_unit_value,
+                    currency=other_currency,
+                    user=host,
+                )
+                await other_user.send(
+                    content=f"🤝 Your collab slip (bet #{bet_id}) is finalized!",
+                    embed=other_embed,
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
     async def _safe_fetch_user(self, user_id: int) -> Optional[discord.abc.User]:
         try:

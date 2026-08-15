@@ -18,7 +18,7 @@ from leg_parser import parse_leg_line
 from prop_play_map import map_play_to_leg, select_option_texts
 from props_loader import try_load_prop_catalog
 
-log = logging.getLogger("ufc-bet-bot.bet_builder")
+from betting_math import parse_stake_odds
 
 MAX_LEGS = 6
 PAGE_SIZE = 25
@@ -495,10 +495,21 @@ class FinishBetModal(discord.ui.Modal, title="Finish Bet"):
         self.units_input = discord.ui.TextInput(
             label="Units", default="1.0", required=True, max_length=10
         )
+        self.odds_type_input = discord.ui.TextInput(
+            label="Odds type",
+            default="american",
+            placeholder="american (default) or decimal",
+            required=False,
+            max_length=12,
+        )
         self.odds_input = discord.ui.TextInput(
-            label="Odds (American, e.g. -150 or 120)", required=False, max_length=10
+            label="Odds",
+            placeholder="-150, +120, or 1.67",
+            required=False,
+            max_length=12,
         )
         self.add_item(self.units_input)
+        self.add_item(self.odds_type_input)
         self.add_item(self.odds_input)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -510,17 +521,17 @@ class FinishBetModal(discord.ui.Modal, title="Finish Bet"):
             )
             return
 
-        odds_raw = self.odds_input.value.strip()
-        odds = None
-        if odds_raw:
-            try:
-                odds = int(odds_raw)
-            except ValueError:
-                await interaction.response.send_message(
-                    "⚠️ Odds must be a whole number, e.g. `-150` or `120`.",
-                    ephemeral=True,
-                )
-                return
+        try:
+            odds, odds_format = parse_stake_odds(
+                self.odds_input.value, odds_format=self.odds_type_input.value
+            )
+        except (ValueError, Exception):
+            await interaction.response.send_message(
+                "⚠️ Odds must be American (`-150`, `+120`) or decimal (`1.67`). "
+                "Set Odds type to `american` or `decimal`.",
+                ephemeral=True,
+            )
+            return
 
         await self.session.cog._log_bet(
             interaction,
@@ -529,6 +540,7 @@ class FinishBetModal(discord.ui.Modal, title="Finish Bet"):
             legs=self.session.legs,
             units=units,
             odds=odds,
+            odds_format=odds_format,
             use_followup=False,
         )
         try:
