@@ -63,7 +63,7 @@ _OUTCOME_KEYWORDS = [
     ("moneyline", "ML"),
     ("money line", "ML"),
     ("to win fight", "ML"),
-    ("to win", "ML"),
+    ("to win the fight", "ML"),
     ("ko/tko", "KO_TKO"),
     ("knockout", "KO_TKO"),
     ("tko", "KO_TKO"),
@@ -116,10 +116,34 @@ def describe_outcome(fighter: str, outcome_type: str, round_num: int | None) -> 
         direction, rest = outcome_type.split("_", 1)
         whole = rest.split("_")[0]
         return f"{fighter} - {direction.title()} {whole}.5 Rounds"
+    if re.match(r"^R_\d+(?:_\d+)*$", outcome_type or "") and not outcome_type.endswith("DEC"):
+        rounds = " or ".join(outcome_type.split("_")[1:])
+        return f"{fighter} to win in round {rounds}"
     desc = f"{fighter} {_OUTCOME_LABELS.get(outcome_type, outcome_type)}"
     if round_num and outcome_type not in ("DEC", "DISTANCE", "NOT_DISTANCE"):
         desc += f" (Round {round_num})"
     return desc
+
+
+_WIN_IN_ROUNDS_RE = re.compile(
+    r"(?:to\s+win|wins?)\s+(?:in\s+)?(?:the\s+)?"
+    r"(?:rounds?|rd\.?|r)\s*"
+    r"(\d)(?:\s*(?:or|/|-|–|—)\s*(\d))?(?:\s*(?:or|/|-|–|—)\s*(\d))?",
+    re.IGNORECASE,
+)
+
+
+def _round_win_type_from_text(text: str) -> tuple[str | None, int | None]:
+    """'Fighter to win in round 2' / 'wins in round 1 or 2' → R_2 / R_1_2."""
+    m = _WIN_IN_ROUNDS_RE.search(text or "")
+    if not m:
+        return None, None
+    rounds = [int(g) for g in m.groups() if g]
+    if not rounds:
+        return None, None
+    if len(rounds) == 1:
+        return f"R_{rounds[0]}", rounds[0]
+    return "R_" + "_".join(str(r) for r in rounds), rounds[0]
 
 
 def _scan_outcome(text: str) -> tuple[str | None, int | None]:
@@ -136,6 +160,10 @@ def _scan_outcome(text: str) -> tuple[str | None, int | None]:
         line = float(tm.group(2))
         whole = int(line)  # 2.5 -> 2 for UNDER_2_5
         return f"{direction}_{whole}_5", None
+
+    round_win, round_win_n = _round_win_type_from_text(text)
+    if round_win:
+        return round_win, round_win_n
 
     if _FIGHT_KO_RE.search(text) or re.search(
         r"\bfight ends by ko\b|\bends by ko/tko\b", text, re.I
@@ -166,6 +194,11 @@ def _scan_outcome(text: str) -> tuple[str | None, int | None]:
         elif re.search(r"\bdec(?:ision)?\b|\bpts\b|\bpoints\b", low):
             outcome_type = "DEC"
 
+    # Bare "to win" is moneyline only when it is not "to win in/by …"
+    if outcome_type is None and re.search(r"\bto\s+win\b", low):
+        if not re.search(r"\bto\s+win\s+(in|by|via|inside)\b", low):
+            outcome_type = "ML"
+
     return outcome_type, round_num
 
 
@@ -173,11 +206,12 @@ def _strip_outcome_noise(text: str) -> str:
     """Remove market words so the remainder is closer to a fighter name."""
     cleaned = text
     cleaned = _TOTALS_RE.sub(" ", cleaned)
+    cleaned = _WIN_IN_ROUNDS_RE.sub(" ", cleaned)
     cleaned = _FIGHT_METHOD_RE.sub(" ", cleaned)
     cleaned = _FIGHT_KO_RE.sub(" ", cleaned)
     cleaned = re.sub(
         r"\b("
-        r"by|via|to\s+win(?:\s+fight)?|ml|moneyline|money\s*line|"
+        r"by|via|to\s+win(?:\s+(?:the\s+)?fight)?|wins?|ml|moneyline|money\s*line|"
         r"ko/?tko|ko/?sub|knockout|tko|ko|dq|"
         r"sub(?:mission)?|decision|dec|pts|points|"
         r"round|rounds?|rd\.?|r\d|"
@@ -189,6 +223,7 @@ def _strip_outcome_noise(text: str) -> str:
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(r"[,\-/+|]+", " ", cleaned)
+    cleaned = re.sub(r"\b[1-5]\b", " ", cleaned)
     return " ".join(cleaned.split())
 
 

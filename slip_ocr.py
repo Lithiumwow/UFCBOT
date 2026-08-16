@@ -400,8 +400,9 @@ def _vision_payload_to_slip(payload: dict[str, Any]) -> dict[str, Any]:
             _record_leg_odds(description, item)
             continue
 
-        # Moneyline / to win — trust fighter_pick (green selection), not opponent
-        if market_name and re.search(r"money\s*line|to\s+win", market_name, re.I):
+        # Moneyline / to win — trust fighter_pick (green selection), not opponent.
+        # "To Win In Round" is a round prop, not a fight winner.
+        if market_name and re.search(r"money\s*line|\bto\s+win\b(?!\s+in)", market_name, re.I):
             base = fighter_pick or description
             base = re.sub(r"\s+to\s+win\b.*$", "", base, flags=re.I).strip() or base
             base = re.sub(r"\s+vs\.?\s+.*$", "", base, flags=re.I).strip() or base

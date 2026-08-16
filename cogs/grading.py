@@ -935,6 +935,26 @@ class GradingCog(commands.Cog):
         if not fight_results:
             return  # ESPN doesn't have this event's card yet/anymore
 
+        try:
+            cursor_bets = await db.get_all_bets("ufc")
+            event_bets = [
+                b
+                for b in cursor_bets
+                if b.get("event")
+                and (
+                    b["event"] == event
+                    or card_data._event_match_score(event, b["event"]) >= 70
+                )
+            ]
+            flipped = await grading.regrade_misfiled_round_wins(
+                db, event_bets, fight_results
+            )
+            for bet_id in flipped:
+                await self._redraw_bet_message(bet_id)
+                log.info("Corrected misfiled round-win bet #%d on %r", bet_id, event)
+        except Exception:
+            log.exception("Round-win ML correction failed for %r", event)
+
         affected_bet_ids: set[int] = set()
 
         for leg in pending_legs:

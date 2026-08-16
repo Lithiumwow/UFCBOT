@@ -116,6 +116,17 @@ class SlipGrader:
         winner = result.get("winner") or ""
         method = (result.get("method") or "").lower()
         rnd = result.get("round")
+        sel_blob = " ".join(
+            str(leg.get(k) or "") for k in ("selection", "label", "raw", "description")
+        )
+        if market in {"ml", "moneyline", "straight"}:
+            m_round = re.search(
+                r"(?:to\s+win|wins?)\s+(?:in\s+)?(?:the\s+)?(?:round|rd\.?)\s*([1-5])",
+                sel_blob,
+                re.I,
+            )
+            if m_round:
+                market = f"r{m_round.group(1)}"
 
         # ---- moneyline ----
         if market in {"ml", "moneyline", "straight"}:
@@ -191,6 +202,13 @@ class SlipGrader:
                 return GradeResult("pending", "Missing fighter/winner", source, result)
             if not _name_hit(fighter, winner):
                 return GradeResult("lost", f"{fighter} did not win", source, result)
+            if method in {"decision", "dec", "unanimous", "split"}:
+                return GradeResult(
+                    "lost",
+                    f"Went to decision (needed a finish in round {want_round})",
+                    source,
+                    result,
+                )
             if rnd is None:
                 return GradeResult(
                     "pending", "Winner found but round unknown", source, result

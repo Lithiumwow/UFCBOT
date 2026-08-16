@@ -83,7 +83,7 @@ def _method_hints(text: str) -> set[str]:
         hints.add("sd")
     if re.search(r"\bdec(?:ision)?\b|\bpoints\b|\bpts\b", t):
         hints.add("dec")
-    if re.search(r"\bml\b|moneyline|money\s*line|\bto win\b(?!\s+by)", t):
+    if re.search(r"\bml\b|moneyline|money\s*line|\bto win\b(?!\s+(?:in|by|via))", t):
         hints.add("ml")
     if re.search(r"inside\s+(?:the\s+)?distance|\bitd\b", t):
         hints.add("id")

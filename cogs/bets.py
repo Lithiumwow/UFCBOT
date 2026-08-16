@@ -9,6 +9,7 @@ from discord.ext import commands
 
 import espn
 import card_data
+import grading
 from bet_builder import BetBuilderSession, BuilderView
 from betting_math import CURRENCY_SYMBOLS, get_user_settings, parse_stake_odds
 from embeds import build_bet_embed, build_results_embed, collect_card_user_ids
@@ -364,6 +365,16 @@ class BetsCog(commands.Cog):
                         f" · matched {stats['matched_fighters']} leg(s) to card"
                         f" (+{stats['created_legs']} new legs)"
                     )
+            except Exception:
+                pass
+
+        try:
+            fight_results = await espn.fetch_fight_results(event)
+        except Exception:
+            fight_results = []
+        if fight_results:
+            try:
+                await grading.regrade_misfiled_round_wins(db, bets, fight_results)
             except Exception:
                 pass
 

@@ -21,6 +21,8 @@ import difflib
 import re
 from typing import Any, Optional
 
+from leg_parser import _round_win_type_from_text
+
 _TOTAL_ROUNDS_RE = re.compile(r"^(OVER|UNDER)_(\d)_5$")
 _ROUND_WIN_RE = re.compile(r"^R_(\d)$")
 _ROUND_WIN_COMBO_RE = re.compile(r"^R_(\d)_(\d)$")
@@ -172,11 +174,29 @@ def grade_bet(bet: dict[str, Any], result: dict[str, Any]) -> Optional[tuple[str
     if not result.get("completed"):
         return None
 
-    outcome_type = (bet.get("outcome_type") or "ML").upper()
+    outcome_type = (bet.get("outcome_type") or "").strip().upper()
     method = result.get("method")
     round_num = result.get("round")
     picked_round = bet.get("outcome_round")
     end_round = _actual_end_round(result)
+    desc = (bet.get("description") or bet.get("bet_title") or "").strip()
+
+    # "Charles to win in round 2" was often stored as ML. That is a round
+    # prop — winning the fight in a different round (or by decision) is a loss.
+    if outcome_type in ("", "ML"):
+        inferred, inferred_n = _round_win_type_from_text(desc)
+        if inferred:
+            outcome_type = inferred
+            if picked_round is None and inferred_n is not None:
+                picked_round = inferred_n
+        elif picked_round is not None and re.search(
+            r"\b(to\s+win|wins?)\s+in\b|\bin\s+round\s*\d",
+            desc,
+            re.I,
+        ):
+            outcome_type = f"R_{int(picked_round)}"
+        elif not outcome_type:
+            outcome_type = "ML"
 
     total_rounds_match = _TOTAL_ROUNDS_RE.match(outcome_type)
     if total_rounds_match:
@@ -354,3 +374,54 @@ def aggregate_bet_status(leg_statuses: list[str]) -> Optional[str]:
     if all(s == "won" for s in leg_statuses):
         return "won"
     return None
+
+
+async def regrade_misfiled_round_wins(
+    db: Any,
+    bets: list[dict[str, Any]],
+    fight_results: list[dict[str, Any]],
+) -> list[int]:
+    """Flip already-settled 'to win rd N' legs that were stored as moneyline."""
+    changed: list[int] = []
+    for bet in bets:
+        bet_id = bet.get("id")
+        if bet_id is None:
+            continue
+        legs = await db.get_legs_for_bet(bet_id)
+        touched = False
+        for leg in legs:
+            desc = (leg.get("description") or bet.get("bet_title") or "").strip()
+            inferred, _ = _round_win_type_from_text(desc)
+            if not inferred:
+                continue
+            lookup = dict(leg)
+            if not lookup.get("fighter_pick"):
+                lookup["fighter_pick"] = bet.get("fighter_pick")
+            if not lookup.get("fighter_pick"):
+                continue
+            result = find_result_for_bet(lookup, fight_results)
+            if result is None:
+                continue
+            outcome = grade_bet(lookup, result)
+            if outcome is None:
+                continue
+            new_status, _ = outcome
+            if new_status != leg.get("status"):
+                await db.update_leg_status(leg["id"], new_status)
+                touched = True
+        if not touched:
+            continue
+        all_legs = await db.get_legs_for_bet(bet_id)
+        statuses = [
+            lg["status"]
+            if (lg.get("fighter_pick") and lg.get("outcome_type"))
+            else (lg.get("status") or "pending")
+            for lg in all_legs
+        ]
+        overall = aggregate_bet_status(statuses)
+        resolved = overall if overall is not None else "pending"
+        if resolved != bet.get("status"):
+            await db.update_status(bet_id, resolved)
+            bet["status"] = resolved
+        changed.append(bet_id)
+    return changed
