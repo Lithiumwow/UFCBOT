@@ -33,6 +33,17 @@ _END_ROUND_RE = re.compile(r"^END_(\d)$")
 _START_ROUND_RE = re.compile(r"^START_(\d)$")
 
 
+def _first_names_compatible(a: str, b: str) -> bool:
+    """Jon/Jonathan yes; Charles/Donte no."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if a[0] != b[0]:
+        return False
+    return a in b or b in a
+
+
 def _name_matches(pick: str, espn_name: str) -> bool:
     """Loose match: exact, one contains the other (handles cases like a bet
     logged as 'Ankalaev' matching ESPN's 'Magomed Ankalaev'), same last
@@ -45,7 +56,19 @@ def _name_matches(pick: str, espn_name: str) -> bool:
     espn_l = espn_name.strip().lower()
     if not pick_l or not espn_l:
         return False
-    if pick_l == espn_l or pick_l in espn_l or espn_l in pick_l:
+    if pick_l == espn_l:
+        return True
+    if pick_l in espn_l or espn_l in pick_l:
+        pick_tokens = pick_l.split()
+        espn_tokens = espn_l.split()
+        # "Charles Johnson" must not match "Donte Johnson" via last name only
+        if (
+            len(pick_tokens) >= 2
+            and len(espn_tokens) >= 2
+            and pick_tokens[-1] == espn_tokens[-1]
+            and not _first_names_compatible(pick_tokens[0], espn_tokens[0])
+        ):
+            return False
         return True
 
     pick_tokens = pick_l.split()
@@ -54,14 +77,39 @@ def _name_matches(pick: str, espn_name: str) -> bool:
         return False
 
     pick_last, espn_last = pick_tokens[-1], espn_tokens[-1]
-    if pick_last == espn_last and len(pick_last) >= 3:
+    last_hit = pick_last == espn_last and len(pick_last) >= 3
+    if not last_hit and len(pick_last) >= 4 and len(espn_last) >= 4:
+        last_hit = difflib.SequenceMatcher(None, pick_last, espn_last).ratio() >= 0.85
+    if not last_hit:
+        return False
+    if len(pick_tokens) == 1 or len(espn_tokens) == 1:
         return True
+    return _first_names_compatible(pick_tokens[0], espn_tokens[0])
 
-    if len(pick_last) >= 4 and len(espn_last) >= 4:
-        ratio = difflib.SequenceMatcher(None, pick_last, espn_last).ratio()
-        if ratio >= 0.85:
-            return True
-    return False
+
+def _result_match_score(picked: str, desc: str, result: dict[str, Any]) -> int:
+    a = result.get("fighter_a") or ""
+    b = result.get("fighter_b") or ""
+    picked_l = (picked or "").strip().lower()
+    desc_l = (desc or "").strip().lower()
+    score = 0
+    for name in (a, b):
+        if not _name_matches(picked, name):
+            continue
+        score += 10
+        if picked_l == name.lower():
+            score += 80
+        pt, nt = picked_l.split(), name.lower().split()
+        if pt and nt and _first_names_compatible(pt[0], nt[0]) and len(pt) >= 2:
+            score += 50
+    for name in (a, b):
+        nl = name.lower()
+        if nl and nl in desc_l:
+            score += 25
+        first = nl.split()[0] if nl else ""
+        if len(first) >= 4 and first in desc_l:
+            score += 15
+    return score
 
 
 def find_result_for_bet(bet: dict[str, Any], fight_results: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -70,9 +118,16 @@ def find_result_for_bet(bet: dict[str, Any], fight_results: list[dict[str, Any]]
     picked = bet.get("fighter_pick")
     if not picked:
         return None
+    desc = (bet.get("description") or bet.get("bet_title") or "")
+    scored: list[tuple[int, dict[str, Any]]] = []
     for result in fight_results:
         if _name_matches(picked, result["fighter_a"]) or _name_matches(picked, result["fighter_b"]):
-            return result
+            scored.append((_result_match_score(picked, desc, result), result))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if len(scored) == 1 or scored[0][0] > scored[1][0]:
+        return scored[0][1]
     return None
 
 

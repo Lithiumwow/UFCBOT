@@ -318,10 +318,11 @@ async def fetch_fight_results(
                     pass
 
         scheduled_rounds = (comp.get("format") or {}).get("regulation", {}).get("periods")
+        elapsed = _elapsed_seconds_in_round(status) if completed else None
 
-        # After a decision ESPN often only says "Final". If the fight reached
-        # the full scheduled rounds with a winner and no method text, treat as DEC
-        # so KO/SUB props grade as losses (not winner-only WON).
+        # After a decision ESPN often only says "Final". A last-round
+        # *stoppage* has the same period as a decision, so only treat it
+        # as DEC when the clock looks like a full round (or is missing).
         if (
             completed
             and method is None
@@ -329,11 +330,10 @@ async def fetch_fight_results(
             and scheduled_rounds
             and round_num is not None
             and int(round_num) >= int(scheduled_rounds)
+            and (elapsed is None or float(elapsed) >= 290)
         ):
             method = "DEC"
             round_num = int(scheduled_rounds)
-
-        elapsed = _elapsed_seconds_in_round(status) if completed else None
 
         results.append(
             {
